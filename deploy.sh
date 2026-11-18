@@ -360,7 +360,7 @@ if [[ "${EXISTING_LICENSES}" == "0" ]]; then
     LIC_STATE="$(echo "${TRIAL_RESP}" | jq -r '.state // "UNKNOWN"')"
     ok "Provisioned Gemini Enterprise 30-day free trial (${LIC_NAME}, state=${LIC_STATE})."
     if [[ "${LIC_STATE}" == "NOT_STARTED" ]]; then
-      info "Note: REST-created trials start at next UTC day (${YEAR}-${MONTH}-${DAY}); to activate seats immediately today, click Start free trial at https://console.cloud.google.com/gen-app-builder/settings/license?project=${HUB_PROJECT_ID}"
+      info "Note: REST-created trials start at next UTC day (${YEAR}-${MONTH}-${DAY}); to activate seats immediately today, open Cloud Console -> Gemini Enterprise -> Subscriptions (https://console.cloud.google.com/gemini-enterprise?project=${HUB_PROJECT_ID})."
     fi
     curl -s -X PATCH \
       "https://${GE_LOCATION}-discoveryengine.googleapis.com/v1alpha/projects/${HUB_PROJECT_ID}/locations/${GE_LOCATION}/userStores/default_user_store?updateMask=defaultLicenseConfig,enableLicenseAutoRegister" \
@@ -373,7 +373,7 @@ if [[ "${EXISTING_LICENSES}" == "0" ]]; then
       }" >/dev/null || true
   else
     warn "Free trial API response: $(echo "${TRIAL_RESP}" | tr -d '\n' | cut -c1-220)"
-    warn "Continuing (you can also enable a trial at https://console.cloud.google.com/gen-app-builder/settings/license?project=${HUB_PROJECT_ID})."
+    warn "Continuing (if your billing account already used its 1-time trial, enable a subscription in Cloud Console -> Gemini Enterprise -> Subscriptions: https://console.cloud.google.com/gemini-enterprise?project=${HUB_PROJECT_ID})."
   fi
 else
   ok "Found ${EXISTING_LICENSES} Gemini Enterprise license config(s) on ${HUB_PROJECT_ID}."
