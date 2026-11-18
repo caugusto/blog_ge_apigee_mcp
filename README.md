@@ -63,12 +63,12 @@ If you prefer to execute and inspect each `gcloud`, `openssl`, and `curl` comman
 
 ## Teardown / Cost Control
 
-When you finish testing, remove the evaluation forwarding rules, PSC attachments, Apigee X runtime instance, and Cloud Run service in one command:
+When you finish testing, delete the Apigee `EVALUATION` organization and both Google Cloud projects in one command (or pass `--keep-projects` to delete only the resources inside them):
 
 ```bash
 ./teardown.sh
-# Or pass --delete-projects to delete both Google Cloud projects completely:
-# ./teardown.sh --delete-projects
+# Optional: pass --keep-projects to remove inner resources while keeping both project shells:
+# ./teardown.sh --keep-projects
 ```
 
 ---

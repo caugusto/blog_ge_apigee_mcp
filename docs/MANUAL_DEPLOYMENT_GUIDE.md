@@ -55,7 +55,7 @@ done
 
 export HUB_PROJECT_NUMBER=$(gcloud projects describe "${HUB_PROJECT_ID}" --format="value(projectNumber)")
 export APIGEE_PROJECT_NUMBER=$(gcloud projects describe "${APIGEE_PROJECT_ID}" --format="value(projectNumber)")
-export ORG_ID=$(gcloud projects get-ancestors "${HUB_PROJECT_ID}" --filter="type=organization" --format="value(id)")
+export ORG_ID=$(gcloud projects get-ancestors "${HUB_PROJECT_ID}" --format=json | jq -r '[.[] | select(.type=="organization") | .id][0] // empty')
 
 if [[ -n "${ORG_ID}" ]]; then
   export TRUST_DOMAIN="agents.global.org-${ORG_ID}.system.id.goog"
@@ -69,49 +69,76 @@ Enable the required APIs across both projects and create the least-privilege ser
 ```bash
 # Enable APIs on HUB_PROJECT_ID
 gcloud services enable \
+  serviceusage.googleapis.com \
+  cloudresourcemanager.googleapis.com \
   discoveryengine.googleapis.com \
   networkservices.googleapis.com \
   networksecurity.googleapis.com \
   serviceextensions.googleapis.com \
   iap.googleapis.com \
   agentregistry.googleapis.com \
+  agentidentity.googleapis.com \
+  agentidentitycredentials.googleapis.com \
+  aiplatform.googleapis.com \
   compute.googleapis.com \
   dns.googleapis.com \
   certificatemanager.googleapis.com \
   run.googleapis.com \
   cloudbuild.googleapis.com \
   artifactregistry.googleapis.com \
+  storage.googleapis.com \
   orgpolicy.googleapis.com \
   iam.googleapis.com \
+  iamcredentials.googleapis.com \
   logging.googleapis.com \
   --project="${HUB_PROJECT_ID}"
 
-# Ensure custom MCP connectors are allowed on HUB_PROJECT_ID if inside an organization
+# Ensure custom MCP connectors and IAM v3 UAP bindings are allowed on HUB_PROJECT_ID
 if [[ -n "${ORG_ID}" ]]; then
-  cat > cfg/allow_custom_mcp_policy.yaml <<EOF
-name: projects/${HUB_PROJECT_NUMBER}/policies/discoveryengine.managed.disableCustomMcpServerConnector
+  for CONSTRAINT in \
+    discoveryengine.managed.disableCustomMcpServerConnector \
+    iam.managed.disableAccessPolicyBinding; do
+    cat > "cfg/policy_${CONSTRAINT}.yaml" <<EOF
+name: projects/${HUB_PROJECT_NUMBER}/policies/${CONSTRAINT}
 spec:
   rules:
   - enforce: false
 EOF
-  gcloud org-policies set-policy cfg/allow_custom_mcp_policy.yaml --project="${HUB_PROJECT_ID}" || true
+    gcloud org-policies set-policy "cfg/policy_${CONSTRAINT}.yaml" --project="${HUB_PROJECT_ID}" || true
+  done
 fi
 
 # Enable APIs & create service agents on APIGEE_PROJECT_ID
 gcloud services enable \
+  serviceusage.googleapis.com \
+  cloudresourcemanager.googleapis.com \
   apigee.googleapis.com \
   compute.googleapis.com \
   run.googleapis.com \
   cloudkms.googleapis.com \
   cloudbuild.googleapis.com \
   artifactregistry.googleapis.com \
+  storage.googleapis.com \
   iam.googleapis.com \
   iamcredentials.googleapis.com \
   logging.googleapis.com \
   --project="${APIGEE_PROJECT_ID}"
 
-for SVC in apigee.googleapis.com cloudkms.googleapis.com compute.googleapis.com; do
+for SVC in apigee.googleapis.com cloudkms.googleapis.com compute.googleapis.com cloudbuild.googleapis.com; do
   gcloud beta services identity create --service="${SVC}" --project="${APIGEE_PROJECT_ID}"
+done
+for SVC in networkservices.googleapis.com discoveryengine.googleapis.com compute.googleapis.com cloudbuild.googleapis.com; do
+  gcloud beta services identity create --service="${SVC}" --project="${HUB_PROJECT_ID}"
+done
+
+# Grant Cloud Build source-deploy roles to Default Compute SAs on blank projects
+for PAIR in "${HUB_PROJECT_ID}:${HUB_PROJECT_NUMBER}" "${APIGEE_PROJECT_ID}:${APIGEE_PROJECT_NUMBER}"; do
+  IFS=":" read -r P_ID P_NUM <<< "${PAIR}"
+  for BUILD_ROLE in roles/storage.admin roles/artifactregistry.writer roles/logging.logWriter roles/cloudbuild.builds.builder; do
+    gcloud projects add-iam-policy-binding "${P_ID}" \
+      --member="serviceAccount:${P_NUM}-compute@developer.gserviceaccount.com" \
+      --role="${BUILD_ROLE}" --condition=None --quiet >/dev/null || true
+  done
 done
 
 export APIGEE_SERVICE_AGENT="service-${APIGEE_PROJECT_NUMBER}@gcp-sa-apigee.iam.gserviceaccount.com"

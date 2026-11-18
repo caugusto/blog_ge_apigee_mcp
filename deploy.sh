@@ -28,7 +28,7 @@ err()   { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 stage() { echo -e "\n${BLUE}==============================================================================${NC}\n${BLUE} $*${NC}\n${BLUE}==============================================================================${NC}"; }
 
 get_token() {
-  gcloud auth print-access-token
+  gcloud auth print-access-token 2>/dev/null
 }
 
 save_env() {
@@ -75,6 +75,16 @@ if [[ -f "${ENV_FILE}" ]]; then
   info "Loading saved configuration from ${ENV_FILE}..."
   # shellcheck disable=SC1090
   source "${ENV_FILE}"
+  if [[ -n "${HUB_PROJECT_ID:-}" ]] && [[ "$(gcloud projects describe "${HUB_PROJECT_ID}" --format='value(lifecycleState)' 2>/dev/null || echo 'MISSING')" == "DELETE_REQUESTED" ]]; then
+    warn "Saved Hub project '${HUB_PROJECT_ID}' is pending deletion; clearing stale project IDs from ${ENV_FILE}."
+    HUB_PROJECT_ID=""
+    APIGEE_PROJECT_ID=""
+    CLOUD_RUN_URL=""
+    EA_HOST=""
+    APIGEE_NB_SERVICE_ATTACHMENT=""
+    MCP_COUNTRIES_REGISTRY_URI=""
+    GE_COUNTRIES_COLLECTION_ID=""
+  fi
 fi
 
 RAND_SUFFIX="$(date +%s | tail -c 5)"
@@ -135,8 +145,12 @@ ok "Saved configuration to ${ENV_FILE}"
 stage "Stage 1: Projects, Billing, APIs & Service Accounts"
 
 for PROJ in "${HUB_PROJECT_ID}" "${APIGEE_PROJECT_ID}"; do
-  if gcloud projects describe "${PROJ}" >/dev/null 2>&1; then
-    ok "Project '${PROJ}' already exists."
+  P_STATE="$(gcloud projects describe "${PROJ}" --format='value(lifecycleState)' 2>/dev/null || echo 'MISSING')"
+  if [[ "${P_STATE}" == "ACTIVE" ]]; then
+    ok "Project '${PROJ}' already exists and is ACTIVE."
+  elif [[ "${P_STATE}" == "DELETE_REQUESTED" ]]; then
+    err "Project '${PROJ}' is in DELETE_REQUESTED state. Run 'gcloud projects undelete ${PROJ}' or re-run ./deploy.sh with a new project ID."
+    exit 1
   else
     info "Creating project '${PROJ}'..."
     gcloud projects create "${PROJ}"
@@ -148,7 +162,7 @@ done
 
 HUB_PROJECT_NUMBER="$(gcloud projects describe "${HUB_PROJECT_ID}" --format='value(projectNumber)')"
 APIGEE_PROJECT_NUMBER="$(gcloud projects describe "${APIGEE_PROJECT_ID}" --format='value(projectNumber)')"
-ORG_ID="$(gcloud projects get-ancestors "${HUB_PROJECT_ID}" --filter='type=organization' --format='value(id)')"
+ORG_ID="$(gcloud projects get-ancestors "${HUB_PROJECT_ID}" --format=json | jq -r '[.[] | select(.type=="organization") | .id][0] // empty')"
 
 if [[ -n "${ORG_ID}" ]]; then
   TRUST_DOMAIN="agents.global.org-${ORG_ID}.system.id.goog"
@@ -157,54 +171,85 @@ else
 fi
 
 info "Enabling Google Cloud APIs on Hub project (${HUB_PROJECT_ID})..."
-gcloud services enable \
-  discoveryengine.googleapis.com \
-  networkservices.googleapis.com \
-  networksecurity.googleapis.com \
-  serviceextensions.googleapis.com \
-  iap.googleapis.com \
-  agentregistry.googleapis.com \
-  compute.googleapis.com \
-  dns.googleapis.com \
-  certificatemanager.googleapis.com \
-  run.googleapis.com \
-  cloudbuild.googleapis.com \
-  artifactregistry.googleapis.com \
-  orgpolicy.googleapis.com \
-  iam.googleapis.com \
-  logging.googleapis.com \
-  --project="${HUB_PROJECT_ID}"
+HUB_APIS=(
+  serviceusage.googleapis.com
+  cloudresourcemanager.googleapis.com
+  discoveryengine.googleapis.com
+  networkservices.googleapis.com
+  networksecurity.googleapis.com
+  serviceextensions.googleapis.com
+  iap.googleapis.com
+  agentregistry.googleapis.com
+  agentidentity.googleapis.com
+  agentidentitycredentials.googleapis.com
+  aiplatform.googleapis.com
+  compute.googleapis.com
+  dns.googleapis.com
+  certificatemanager.googleapis.com
+  run.googleapis.com
+  cloudbuild.googleapis.com
+  artifactregistry.googleapis.com
+  storage.googleapis.com
+  orgpolicy.googleapis.com
+  iam.googleapis.com
+  iamcredentials.googleapis.com
+  logging.googleapis.com
+)
+if ! gcloud services enable "${HUB_APIS[@]}" --project="${HUB_PROJECT_ID}"; then
+  warn "Batch API enablement had a warning; enabling Hub APIs individually..."
+  for api in "${HUB_APIS[@]}"; do
+    gcloud services enable "${api}" --project="${HUB_PROJECT_ID}" 2>/dev/null || warn "Optional/preview API '${api}' skipped."
+  done
+fi
 
 if [[ -n "${ORG_ID}" ]]; then
-  info "Ensuring custom MCP connectors are allowed on ${HUB_PROJECT_ID}..."
-  cat > cfg/allow_custom_mcp_policy.yaml <<EOF
-name: projects/${HUB_PROJECT_NUMBER}/policies/discoveryengine.managed.disableCustomMcpServerConnector
+  info "Ensuring custom MCP connectors and IAM v3 UAP bindings are allowed on ${HUB_PROJECT_ID}..."
+  for CONSTRAINT in \
+    discoveryengine.managed.disableCustomMcpServerConnector \
+    iam.managed.disableAccessPolicyBinding; do
+    cat > "cfg/policy_${CONSTRAINT}.yaml" <<EOF
+name: projects/${HUB_PROJECT_NUMBER}/policies/${CONSTRAINT}
 spec:
   rules:
   - enforce: false
 EOF
-  gcloud org-policies set-policy cfg/allow_custom_mcp_policy.yaml --project="${HUB_PROJECT_ID}" >/dev/null 2>&1 || \
-    warn "Could not override disableCustomMcpServerConnector (may already be allowed or require Org Policy Admin)."
+    gcloud org-policies set-policy "cfg/policy_${CONSTRAINT}.yaml" --project="${HUB_PROJECT_ID}" >/dev/null 2>&1 || \
+      warn "Could not override ${CONSTRAINT} (may already be allowed or require Org Policy Admin)."
+  done
 fi
 
 info "Enabling Google Cloud APIs on Apigee & MCP project (${APIGEE_PROJECT_ID})..."
-gcloud services enable \
-  apigee.googleapis.com \
-  compute.googleapis.com \
-  run.googleapis.com \
-  cloudkms.googleapis.com \
-  cloudbuild.googleapis.com \
-  artifactregistry.googleapis.com \
-  iam.googleapis.com \
-  iamcredentials.googleapis.com \
-  logging.googleapis.com \
-  --project="${APIGEE_PROJECT_ID}"
+APIGEE_APIS=(
+  serviceusage.googleapis.com
+  cloudresourcemanager.googleapis.com
+  apigee.googleapis.com
+  compute.googleapis.com
+  run.googleapis.com
+  cloudkms.googleapis.com
+  cloudbuild.googleapis.com
+  artifactregistry.googleapis.com
+  storage.googleapis.com
+  iam.googleapis.com
+  iamcredentials.googleapis.com
+  logging.googleapis.com
+)
+gcloud services enable "${APIGEE_APIS[@]}" --project="${APIGEE_PROJECT_ID}"
 
-for SVC in apigee.googleapis.com cloudkms.googleapis.com compute.googleapis.com; do
+for SVC in apigee.googleapis.com cloudkms.googleapis.com compute.googleapis.com cloudbuild.googleapis.com; do
   gcloud beta services identity create --service="${SVC}" --project="${APIGEE_PROJECT_ID}" >/dev/null 2>&1 || true
 done
-for SVC in networkservices.googleapis.com discoveryengine.googleapis.com; do
+for SVC in networkservices.googleapis.com discoveryengine.googleapis.com compute.googleapis.com cloudbuild.googleapis.com; do
   gcloud beta services identity create --service="${SVC}" --project="${HUB_PROJECT_ID}" >/dev/null 2>&1 || true
+done
+
+# Grant Cloud Build source-deploy permissions to Default Compute SAs (required when iam.automaticIamGrantsForDefaultServiceAccounts is enforced)
+for PAIR in "${HUB_PROJECT_ID}:${HUB_PROJECT_NUMBER}" "${APIGEE_PROJECT_ID}:${APIGEE_PROJECT_NUMBER}"; do
+  IFS=":" read -r P_ID P_NUM <<< "${PAIR}"
+  for BUILD_ROLE in roles/storage.admin roles/artifactregistry.writer roles/logging.logWriter roles/cloudbuild.builds.builder; do
+    gcloud projects add-iam-policy-binding "${P_ID}" \
+      --member="serviceAccount:${P_NUM}-compute@developer.gserviceaccount.com" \
+      --role="${BUILD_ROLE}" --condition=None --quiet >/dev/null 2>&1 || true
+  done
 done
 
 APIGEE_SERVICE_AGENT="service-${APIGEE_PROJECT_NUMBER}@gcp-sa-apigee.iam.gserviceaccount.com"
@@ -421,6 +466,30 @@ if ! gcloud dns managed-zones describe zone-corp-internal --project="${HUB_PROJE
     --visibility=private --networks=vpc-mcp-internal --project="${HUB_PROJECT_ID}"
 fi
 
+AGW_SA="service-${HUB_PROJECT_NUMBER}@gcp-sa-agentgateway.iam.gserviceaccount.com"
+if ! gcloud projects add-iam-policy-binding "${HUB_PROJECT_ID}" \
+  --member="serviceAccount:${AGW_SA}" \
+  --role="roles/agentgateway.serviceAgent" --condition=None --quiet >/dev/null 2>&1; then
+  info "Initializing Agent Gateway service agent (${AGW_SA}) on blank project..."
+  BOOT_OP="$(curl -s -X POST \
+    "https://networkservices.googleapis.com/v1/projects/${HUB_PROJECT_ID}/locations/${REGION}/agentGateways?agentGatewayId=agw-sa-init" \
+    -H "Authorization: Bearer $(get_token)" \
+    -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" \
+    -H "Content-Type: application/json" \
+    -d '{"protocols":["MCP"],"googleManaged":{"governedAccessPath":"AGENT_TO_ANYWHERE"}}' | jq -r '.name // empty')"
+  if [[ -n "${BOOT_OP}" ]]; then
+    for _ in {1..30}; do
+      [[ "$(curl -s -H "Authorization: Bearer $(get_token)" -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" "https://networkservices.googleapis.com/v1/${BOOT_OP}" | jq -r '.done // false')" == "true" ]] && break
+      sleep 5
+    done
+    DEL_BOOT="$(curl -s -X DELETE \
+      "https://networkservices.googleapis.com/v1/projects/${HUB_PROJECT_ID}/locations/${REGION}/agentGateways/agw-sa-init" \
+      -H "Authorization: Bearer $(get_token)" \
+      -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" | jq -r '.name // empty')"
+    [[ -n "${DEL_BOOT}" ]] && sleep 5
+  fi
+fi
+
 for ROLE in \
   roles/agentgateway.serviceAgent \
   roles/compute.networkViewer \
@@ -428,7 +497,7 @@ for ROLE in \
   roles/dns.reader \
   roles/certificatemanager.viewer; do
   gcloud projects add-iam-policy-binding "${HUB_PROJECT_ID}" \
-    --member="serviceAccount:service-${HUB_PROJECT_NUMBER}@gcp-sa-agentgateway.iam.gserviceaccount.com" \
+    --member="serviceAccount:${AGW_SA}" \
     --role="${ROLE}" --condition=None --quiet >/dev/null
 done
 
@@ -524,28 +593,58 @@ if [[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(get_
   done
 fi
 
-if ! gcloud iam access-policies describe agent-gateway-allow-policy --location=global --project="${HUB_PROJECT_ID}" >/dev/null 2>&1; then
-  cat > cfg/uap-allow-registered.json <<EOF
-[
-  {
-    "description": "Allow agent egress to Google APIs and registered Agent Registry services",
-    "effect": "ALLOW",
-    "principals": ["principalSet://${TRUST_DOMAIN}/*"],
-    "operation": {"permissions": ["iap.googleapis.com/resources.egressViaIAP"]},
-    "conditions": {
-      "iap.googleapis.com": {
-        "expression": "destination.unregistered.host.endsWith('googleapis.com') || destination.is_registered == true"
+UAP_GET="https://iam.googleapis.com/v3/projects/${HUB_PROJECT_ID}/locations/global/accessPolicies/agent-gateway-allow-policy"
+if [[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(get_token)" -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" "${UAP_GET}")" != "200" ]]; then
+  info "Creating IAM v3 Universal Access Policy 'agent-gateway-allow-policy'..."
+  UAP_OP="$(curl -s -X POST \
+    "https://iam.googleapis.com/v3/projects/${HUB_PROJECT_ID}/locations/global/accessPolicies?accessPolicyId=agent-gateway-allow-policy" \
+    -H "Authorization: Bearer $(get_token)" \
+    -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" \
+    -H "Content-Type: application/json" \
+    -d "{
+      \"details\": {
+        \"rules\": [
+          {
+            \"description\": \"Allow agent egress to Google APIs and registered Agent Registry services\",
+            \"effect\": \"ALLOW\",
+            \"principals\": [\"principalSet://${TRUST_DOMAIN}/*\"],
+            \"operation\": {\"permissions\": [\"iap.googleapis.com/resources.egressViaIAP\"]},
+            \"conditions\": {
+              \"iap.googleapis.com\": {
+                \"expression\": \"destination.unregistered.host.endsWith('googleapis.com') || destination.is_registered == true\"
+              }
+            }
+          }
+        ]
       }
-    }
-  }
-]
-EOF
-  gcloud iam access-policies create agent-gateway-allow-policy \
-    --details-rules=cfg/uap-allow-registered.json --project="${HUB_PROJECT_ID}" --location=global
-  gcloud iam policy-bindings create agent-gateway-allow-binding \
-    --policy="projects/${HUB_PROJECT_ID}/locations/global/accessPolicies/agent-gateway-allow-policy" \
-    --target-resource="//cloudresourcemanager.googleapis.com/projects/${HUB_PROJECT_ID}" \
-    --project="${HUB_PROJECT_ID}" --location=global
+    }" | jq -r '.name // empty')"
+  if [[ -n "${UAP_OP}" ]]; then
+    while [[ "$(curl -s -H "Authorization: Bearer $(get_token)" -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" "https://iam.googleapis.com/v3/${UAP_OP}" | jq -r '.done // false')" != "true" ]]; do
+      sleep 3
+    done
+  fi
+fi
+
+BIND_GET="https://iam.googleapis.com/v3/projects/${HUB_PROJECT_ID}/locations/global/policyBindings/agent-gateway-allow-binding"
+if [[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(get_token)" -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" "${BIND_GET}")" != "200" ]]; then
+  info "Binding IAM v3 Universal Access Policy to project '${HUB_PROJECT_ID}'..."
+  BIND_OP="$(curl -s -X POST \
+    "https://iam.googleapis.com/v3/projects/${HUB_PROJECT_ID}/locations/global/policyBindings?policyBindingId=agent-gateway-allow-binding" \
+    -H "Authorization: Bearer $(get_token)" \
+    -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" \
+    -H "Content-Type: application/json" \
+    -d "{
+      \"policyKind\": \"ACCESS\",
+      \"policy\": \"projects/${HUB_PROJECT_ID}/locations/global/accessPolicies/agent-gateway-allow-policy\",
+      \"target\": {
+        \"resource\": \"//cloudresourcemanager.googleapis.com/projects/${HUB_PROJECT_ID}\"
+      }
+    }" | jq -r '.name // empty')"
+  if [[ -n "${BIND_OP}" ]]; then
+    while [[ "$(curl -s -H "Authorization: Bearer $(get_token)" -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" "https://iam.googleapis.com/v3/${BIND_OP}" | jq -r '.done // false')" != "true" ]]; do
+      sleep 3
+    done
+  fi
 fi
 
 info "Binding '${GE_APP_ID}' defaultEgressAgentGateway to '${AGW_NAME}'..."
@@ -921,21 +1020,38 @@ if ! gcloud dns record-sets describe "${COUNTRIES_HOST}." --type=A --zone=zone-c
     --zone=zone-corp-internal --type=A --ttl=60 \
     --rrdatas="${HUB_APIGEE_ILB_IP}" --project="${HUB_PROJECT_ID}"
 fi
-if ! gcloud agent-registry services describe mcp-countries-poc --location="${REGION}" --project="${HUB_PROJECT_ID}" >/dev/null 2>&1; then
-  gcloud agent-registry services create mcp-countries-poc \
-    --location="${REGION}" --project="${HUB_PROJECT_ID}" \
-    --display-name="Country Facts MCP Server (Apigee X + PSC + OAuth2)" \
-    --description="Internal Country Facts StreamableHTTP MCP server hosted in ${APIGEE_PROJECT_ID} behind Apigee X over Northbound and Southbound PSC (${COUNTRIES_MCP_URL})." \
-    --mcp-server-spec-type=tool-spec \
-    --mcp-server-spec-content=cfg/toolspec_countries.json \
-    --interfaces="protocolBinding=JSONRPC,url=${COUNTRIES_MCP_URL}"
+AR_SVC_URL="https://agentregistry.googleapis.com/v1/projects/${HUB_PROJECT_ID}/locations/${REGION}/services/mcp-countries-poc"
+if [[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(get_token)" -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" "${AR_SVC_URL}")" != "200" ]]; then
+  info "Registering 'mcp-countries-poc' in Hub Agent Registry..."
+  TOOLSPEC_JSON="$(cat cfg/toolspec_countries.json)"
+  AR_OP="$(curl -s -X POST \
+    "https://agentregistry.googleapis.com/v1/projects/${HUB_PROJECT_ID}/locations/${REGION}/services?serviceId=mcp-countries-poc" \
+    -H "Authorization: Bearer $(get_token)" \
+    -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" \
+    -H "Content-Type: application/json" \
+    -d "{
+      \"displayName\": \"Country Facts MCP Server (Apigee X + PSC + OAuth2)\",
+      \"description\": \"Internal Country Facts StreamableHTTP MCP server hosted in ${APIGEE_PROJECT_ID} behind Apigee X over Northbound and Southbound PSC (${COUNTRIES_MCP_URL}).\",
+      \"interfaces\": [{\"protocolBinding\": \"JSONRPC\", \"url\": \"${COUNTRIES_MCP_URL}\"}],
+      \"mcpServerSpec\": {\"type\": \"TOOL_SPEC\", \"content\": ${TOOLSPEC_JSON}}
+    }" | jq -r '.name // empty')"
+  if [[ -n "${AR_OP}" ]]; then
+    while [[ "$(curl -s -H "Authorization: Bearer $(get_token)" -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" "https://agentregistry.googleapis.com/v1/${AR_OP}" | jq -r '.done // false')" != "true" ]]; do
+      sleep 3
+    done
+  fi
 fi
 
-MCP_COUNTRIES_REGISTRY_URI="$(curl -s \
-  -H "Authorization: Bearer $(get_token)" \
-  -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" \
-  "https://agentregistry.googleapis.com/v1alpha/projects/${HUB_PROJECT_ID}/locations/${REGION}/mcpServers" \
-  | jq -r --arg url "${COUNTRIES_MCP_URL}" '.mcpServers[] | select(.interfaces[].url == $url) | .name')"
+MCP_COUNTRIES_REGISTRY_URI=""
+for _ in {1..15}; do
+  MCP_COUNTRIES_REGISTRY_URI="$(curl -s \
+    -H "Authorization: Bearer $(get_token)" \
+    -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" \
+    "https://agentregistry.googleapis.com/v1alpha/projects/${HUB_PROJECT_ID}/locations/${REGION}/mcpServers" \
+    | jq -r --arg url "${COUNTRIES_MCP_URL}" '.mcpServers[]? | select(.interfaces[]?.url == $url) | .name' | head -n 1)"
+  [[ -n "${MCP_COUNTRIES_REGISTRY_URI}" ]] && break
+  sleep 4
+done
 save_env
 ok "Agent Registry MCP Server URI: ${MCP_COUNTRIES_REGISTRY_URI}"
 

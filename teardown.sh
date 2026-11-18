@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Clean Teardown Script:
-# Removes evaluation ALBs, PSC attachments, Gemini Enterprise MCP connector,
-# Apigee X runtime instance, and Cloud Run service to stop ongoing charges.
-# Pass `--delete-projects` to also delete the Apigee EVALUATION org and both
-# Google Cloud projects completely.
+# By default, deletes the Apigee EVALUATION organization and deletes BOTH
+# Google Cloud projects (${APIGEE_PROJECT_ID} and ${HUB_PROJECT_ID}) completely,
+# then removes .env so a future ./deploy.sh run starts fresh.
+#
+# Pass `--keep-projects` if you prefer to delete only the provisioned resources
+# inside the projects while keeping the project shells alive.
 # ==============================================================================
 set -euo pipefail
 
@@ -19,16 +21,17 @@ fi
 # shellcheck disable=SC1090
 source "${ENV_FILE}"
 
-DELETE_PROJECTS=false
+DELETE_PROJECTS=true
 AUTO_YES=false
 for arg in "$@"; do
+  [[ "${arg}" == "--keep-projects" ]] && DELETE_PROJECTS=false
   [[ "${arg}" == "--delete-projects" ]] && DELETE_PROJECTS=true
   [[ "${arg}" == "--yes" || "${arg}" == "-y" ]] && AUTO_YES=true
 done
 
 echo "Target Hub Project:    ${HUB_PROJECT_ID}"
 echo "Target Apigee Project: ${APIGEE_PROJECT_ID}"
-echo "Delete Full Projects:  ${DELETE_PROJECTS}"
+echo "Delete Full Projects:  ${DELETE_PROJECTS} (default; pass --keep-projects to retain project shells)"
 
 if [[ "${AUTO_YES}" != "true" ]]; then
   read -r -p "Proceed with teardown? [y/N]: " CONFIRM
@@ -38,14 +41,19 @@ fi
 TOKEN="$(gcloud auth print-access-token 2>/dev/null)"
 
 if [[ "${DELETE_PROJECTS}" == "true" ]]; then
-  echo "Deleting Apigee X EVALUATION organization '${APIGEE_PROJECT_ID}' (retention=MINIMUM)..."
+  echo "[1/3] Releasing Apigee X EVALUATION organization '${APIGEE_PROJECT_ID}' (if provisioned)..."
   curl -s -X DELETE \
     "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}?retention=MINIMUM" \
-    -H "Authorization: Bearer ${TOKEN}" >/dev/null || true
-  sleep 5
-  gcloud projects delete "${APIGEE_PROJECT_ID}" --quiet
-  gcloud projects delete "${HUB_PROJECT_ID}" --quiet
-  echo "Deleted projects ${APIGEE_PROJECT_ID} and ${HUB_PROJECT_ID}."
+    -H "Authorization: Bearer ${TOKEN}" >/dev/null 2>&1 || true
+
+  echo "[2/3] Deleting project '${APIGEE_PROJECT_ID}'..."
+  gcloud projects delete "${APIGEE_PROJECT_ID}" --quiet || true
+
+  echo "[3/3] Deleting project '${HUB_PROJECT_ID}'..."
+  gcloud projects delete "${HUB_PROJECT_ID}" --quiet || true
+
+  rm -f "${ENV_FILE}"
+  echo "Deleted projects ${APIGEE_PROJECT_ID} and ${HUB_PROJECT_ID}, and cleared ${ENV_FILE}."
   exit 0
 fi
 
@@ -69,7 +77,10 @@ if [[ -n "${GE_COUNTRIES_COLLECTION_ID:-}" ]]; then
     -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" >/dev/null || true
 fi
 
-gcloud agent-registry services delete mcp-countries-poc --location="${REGION}" --project="${HUB_PROJECT_ID}" --quiet || true
+curl -s -X DELETE \
+  "https://agentregistry.googleapis.com/v1/projects/${HUB_PROJECT_ID}/locations/${REGION}/services/mcp-countries-poc" \
+  -H "Authorization: Bearer ${TOKEN}" \
+  -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" >/dev/null 2>&1 || true
 gcloud run jobs delete mcp-countries-vpc-verifier --region="${REGION}" --project="${HUB_PROJECT_ID}" --quiet || true
 gcloud dns record-sets delete "${COUNTRIES_HOST}." --type=A --zone=zone-corp-internal --project="${HUB_PROJECT_ID}" --quiet || true
 gcloud compute forwarding-rules delete fr-apigee-countries --region="${REGION}" --project="${HUB_PROJECT_ID}" --quiet || true
@@ -97,4 +108,4 @@ gcloud compute backend-services delete bs-mcp-countries-poc --region="${REGION}"
 gcloud compute network-endpoint-groups delete neg-mcp-countries-poc --region="${REGION}" --project="${APIGEE_PROJECT_ID}" --quiet || true
 gcloud run services delete mcp-countries-poc --region="${REGION}" --project="${APIGEE_PROJECT_ID}" --quiet || true
 
-echo "Teardown complete."
+echo "Teardown complete (projects kept)."
