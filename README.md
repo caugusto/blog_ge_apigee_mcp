@@ -12,7 +12,7 @@ Complete reference implementation and automation suite for connecting an **inter
 
 ### Key Enterprise Capabilities
 - **Zero Public Internet & Zero VPC Peering:** Public `*.run.app` access returns `HTTP 404`. Traffic traverses Hub Agent Gateway -> Hub Internal HTTPS ALB (`10.10.1.30:443`) -> Northbound PSC NEG -> Apigee X -> Southbound `EndpointAttachment` -> Producer Internal HTTPS ALB (`10.30.1.10:443`) -> Cloud Run.
-- **Dual-Credential Token Translation (Zero Org Policy Exceptions):** Apigee X preserves the signed-in employee's 3LO Google OAuth 2.0 token in `X-MCP-User-Authorization` and mints a Cloud Run OIDC ID token (`<GoogleIDToken>`) as `sa-apigee-invoker`, keeping `constraints/iam.allowedPolicyMemberDomains` (`--no-allow-unauthenticated`) strictly enforced.
+- **Two-Layer Auth via Dual-Credential Translation:** Apigee X preserves the signed-in employee's 3LO Google OAuth 2.0 access token in `X-MCP-User-Authorization` and mints a Google-signed Cloud Run OIDC ID token (`<GoogleIDToken>`) as `sa-apigee-invoker`, keeping Cloud Run's platform IAM invoker check (`--no-allow-unauthenticated`) active alongside end-user OAuth validation.
 - **Governed Discovery & Traffic Protection:** Hub Agent Registry + IAM v3 Universal Access Policies (`destination.is_registered == true`) govern outbound AI egress while Apigee X enforces `SpikeArrest` (`30ps`) rate limiting.
 
 ![Two-Project Layout and Evaluation Cost Profile](./images/08_table_project_layout_cost.jpg)
