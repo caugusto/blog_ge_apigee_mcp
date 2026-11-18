@@ -11,15 +11,28 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
 ENV_FILE="${ENV_FILE:-.env}"
+LOG_FILE="${SCRIPT_DIR}/deploy.log"
+PID_FILE="${SCRIPT_DIR}/.deploy.pid"
+
+BACKGROUND_MODE=false
+UNATTENDED_WORKER=false
+RECONFIGURE=false
+for arg in "$@"; do
+  case "${arg}" in
+    --background|-b) BACKGROUND_MODE=true ;;
+    --unattended-worker) UNATTENDED_WORKER=true ;;
+    --reconfigure) RECONFIGURE=true ;;
+  esac
+done
 
 # ------------------------------------------------------------------------------
 # Pretty logging helpers
 # ------------------------------------------------------------------------------
-BLUE="\033[1;34m"
-GREEN="\033[1;32m"
-YELLOW="\033[1;33m"
-RED="\033[1;31m"
-NC="\033[0m"
+if [[ -t 1 ]]; then
+  BLUE="\033[1;34m"; GREEN="\033[1;32m"; YELLOW="\033[1;33m"; RED="\033[1;31m"; NC="\033[0m"
+else
+  BLUE=""; GREEN=""; YELLOW=""; RED=""; NC=""
+fi
 
 info()  { echo -e "${BLUE}[INFO]${NC}  $*"; }
 ok()    { echo -e "${GREEN}[OK]${NC}    $*"; }
@@ -54,91 +67,106 @@ EOF
   chmod 600 "${ENV_FILE}"
 }
 
-# ------------------------------------------------------------------------------
-# Stage 0: Preflight & Interactive Configuration Wizard
-# ------------------------------------------------------------------------------
-stage "Stage 0: Preflight Checks & Interactive Setup"
+if [[ "${UNATTENDED_WORKER}" != "true" ]]; then
+  # ----------------------------------------------------------------------------
+  # Stage 0: Preflight & Interactive Configuration Wizard
+  # ----------------------------------------------------------------------------
+  stage "Stage 0: Preflight Checks & Interactive Setup"
 
-for cmd in gcloud curl jq openssl zip python3 sed; do
-  if ! command -v "${cmd}" >/dev/null 2>&1; then
-    err "Required CLI '${cmd}' is not installed. Install it and re-run ./deploy.sh."
-    exit 1
+  for cmd in gcloud curl jq openssl zip python3 sed; do
+    if ! command -v "${cmd}" >/dev/null 2>&1; then
+      err "Required CLI '${cmd}' is not installed. Install it and re-run ./deploy.sh."
+      exit 1
+    fi
+  done
+
+  if ! gcloud auth print-access-token >/dev/null 2>&1; then
+    warn "No active gcloud session detected. Launching 'gcloud auth login'..."
+    gcloud auth login
   fi
-done
 
-if ! gcloud auth print-access-token >/dev/null 2>&1; then
-  warn "No active gcloud session detected. Launching 'gcloud auth login'..."
-  gcloud auth login
-fi
+  HAS_ACTIVE_ENV=false
+  if [[ -f "${ENV_FILE}" ]]; then
+    info "Loading saved configuration from ${ENV_FILE}..."
+    # shellcheck disable=SC1090
+    source "${ENV_FILE}"
+    if [[ -n "${HUB_PROJECT_ID:-}" ]]; then
+      HUB_LIFE="$(gcloud projects describe "${HUB_PROJECT_ID}" --format='value(lifecycleState)' 2>/dev/null || echo 'MISSING')"
+      if [[ "${HUB_LIFE}" == "DELETE_REQUESTED" ]]; then
+        warn "Saved Hub project '${HUB_PROJECT_ID}' is pending deletion; clearing stale project IDs from ${ENV_FILE}."
+        HUB_PROJECT_ID=""; APIGEE_PROJECT_ID=""; CLOUD_RUN_URL=""; EA_HOST=""
+        APIGEE_NB_SERVICE_ATTACHMENT=""; MCP_COUNTRIES_REGISTRY_URI=""; GE_COUNTRIES_COLLECTION_ID=""
+      elif [[ "${HUB_LIFE}" == "ACTIVE" && -n "${BILLING_ACCOUNT_ID:-}" && -n "${APIGEE_PROJECT_ID:-}" && "${RECONFIGURE}" != "true" ]]; then
+        HAS_ACTIVE_ENV=true
+      fi
+    fi
+  fi
 
-if [[ -f "${ENV_FILE}" ]]; then
-  info "Loading saved configuration from ${ENV_FILE}..."
+  if [[ "${HAS_ACTIVE_ENV}" == "true" ]]; then
+    ok "Auto-resuming with active configuration from ${ENV_FILE} (Hub: ${HUB_PROJECT_ID}, Apigee: ${APIGEE_PROJECT_ID}). Pass --reconfigure to change."
+  else
+    RAND_SUFFIX="$(date +%s | tail -c 5)"
+    DEFAULT_BILLING="$(gcloud billing accounts list --filter='open=true' --format='value(name)' 2>/dev/null | head -n 1 | sed 's|billingAccounts/||')"
+
+    echo ""
+    info "Press Enter to accept [default] values, or type a custom value:"
+    echo ""
+
+    if [[ -z "${BILLING_ACCOUNT_ID:-}" || "${RECONFIGURE}" == "true" ]]; then
+      if [[ -n "${DEFAULT_BILLING}" ]]; then
+        info "Detected open billing accounts:"
+        gcloud billing accounts list --filter="open=true" --format="table(name.basename(),displayName,open)" || true
+      fi
+      DEF_BILL="${BILLING_ACCOUNT_ID:-${DEFAULT_BILLING}}"
+      read -r -p "1. Google Cloud Billing Account ID [${DEF_BILL}]: " INPUT_BILLING
+      BILLING_ACCOUNT_ID="${INPUT_BILLING:-${DEF_BILL}}"
+    fi
+    if [[ -z "${BILLING_ACCOUNT_ID}" ]]; then
+      err "BILLING_ACCOUNT_ID is required."
+      exit 1
+    fi
+
+    DEF_HUB="${HUB_PROJECT_ID:-ge-mcp-hub-${RAND_SUFFIX}}"
+    read -r -p "2. Hub AI & Governance Project ID [${DEF_HUB}]: " INPUT_HUB
+    HUB_PROJECT_ID="${INPUT_HUB:-${DEF_HUB}}"
+
+    DEF_APIGEE="${APIGEE_PROJECT_ID:-apigee-mcp-${RAND_SUFFIX}}"
+    read -r -p "3. Dedicated Apigee X & MCP Project ID [${DEF_APIGEE}]: " INPUT_APIGEE
+    APIGEE_PROJECT_ID="${INPUT_APIGEE:-${DEF_APIGEE}}"
+
+    DEF_REGION="${REGION:-us-central1}"
+    read -r -p "4. Google Cloud Region [${DEF_REGION}]: " INPUT_REGION
+    REGION="${INPUT_REGION:-${DEF_REGION}}"
+
+    DEF_APP="${GE_APP_ID:-ge-apigee-mcp-app}"
+    read -r -p "5. Gemini Enterprise App ID [${DEF_APP}]: " INPUT_APP
+    GE_APP_ID="${INPUT_APP:-${DEF_APP}}"
+
+    DEF_COMPANY="${COMPANY_NAME:-Enterprise AI}"
+    read -r -p "6. Company Display Name for Gemini Enterprise [${DEF_COMPANY}]: " INPUT_COMPANY
+    COMPANY_NAME="${INPUT_COMPANY:-${DEF_COMPANY}}"
+  fi
+
+  GE_LOCATION="${GE_LOCATION:-global}"
+  COUNTRIES_HOST="${COUNTRIES_HOST:-mcp-countries.corp.internal}"
+  COUNTRIES_MCP_URL="https://${COUNTRIES_HOST}/mcp"
+  HUB_APIGEE_ILB_IP="${HUB_APIGEE_ILB_IP:-10.10.1.30}"
+  SB_ILB_IP="${SB_ILB_IP:-10.30.1.10}"
+  OAUTH_CLIENT_ID="${OAUTH_CLIENT_ID:-}"
+  OAUTH_CLIENT_SECRET="${OAUTH_CLIENT_SECRET:-}"
+
+  mkdir -p certs cfg
+  save_env
+  ok "Saved configuration to ${ENV_FILE}"
+else
+  # Unattended background worker: load saved .env directly
   # shellcheck disable=SC1090
   source "${ENV_FILE}"
-  if [[ -n "${HUB_PROJECT_ID:-}" ]] && [[ "$(gcloud projects describe "${HUB_PROJECT_ID}" --format='value(lifecycleState)' 2>/dev/null || echo 'MISSING')" == "DELETE_REQUESTED" ]]; then
-    warn "Saved Hub project '${HUB_PROJECT_ID}' is pending deletion; clearing stale project IDs from ${ENV_FILE}."
-    HUB_PROJECT_ID=""
-    APIGEE_PROJECT_ID=""
-    CLOUD_RUN_URL=""
-    EA_HOST=""
-    APIGEE_NB_SERVICE_ATTACHMENT=""
-    MCP_COUNTRIES_REGISTRY_URI=""
-    GE_COUNTRIES_COLLECTION_ID=""
-  fi
+  COUNTRIES_MCP_URL="https://${COUNTRIES_HOST}/mcp"
+  mkdir -p certs cfg
 fi
 
-RAND_SUFFIX="$(date +%s | tail -c 5)"
-DEFAULT_BILLING="$(gcloud billing accounts list --filter='open=true' --format='value(name)' 2>/dev/null | head -n 1 | sed 's|billingAccounts/||')"
-
-echo ""
-info "Press Enter to accept [default] values, or type a custom value:"
-echo ""
-
-if [[ -z "${BILLING_ACCOUNT_ID:-}" ]]; then
-  if [[ -n "${DEFAULT_BILLING}" ]]; then
-    info "Detected open billing accounts:"
-    gcloud billing accounts list --filter="open=true" --format="table(name.basename(),displayName,open)" || true
-  fi
-  read -r -p "1. Google Cloud Billing Account ID [${DEFAULT_BILLING}]: " INPUT_BILLING
-  BILLING_ACCOUNT_ID="${INPUT_BILLING:-${DEFAULT_BILLING}}"
-fi
-if [[ -z "${BILLING_ACCOUNT_ID}" ]]; then
-  err "BILLING_ACCOUNT_ID is required."
-  exit 1
-fi
-
-DEF_HUB="${HUB_PROJECT_ID:-ge-mcp-hub-${RAND_SUFFIX}}"
-read -r -p "2. Hub AI & Governance Project ID [${DEF_HUB}]: " INPUT_HUB
-HUB_PROJECT_ID="${INPUT_HUB:-${DEF_HUB}}"
-
-DEF_APIGEE="${APIGEE_PROJECT_ID:-apigee-mcp-${RAND_SUFFIX}}"
-read -r -p "3. Dedicated Apigee X & MCP Project ID [${DEF_APIGEE}]: " INPUT_APIGEE
-APIGEE_PROJECT_ID="${INPUT_APIGEE:-${DEF_APIGEE}}"
-
-DEF_REGION="${REGION:-us-central1}"
-read -r -p "4. Google Cloud Region [${DEF_REGION}]: " INPUT_REGION
-REGION="${INPUT_REGION:-${DEF_REGION}}"
-
-DEF_APP="${GE_APP_ID:-ge-apigee-mcp-app}"
-read -r -p "5. Gemini Enterprise App ID [${DEF_APP}]: " INPUT_APP
-GE_APP_ID="${INPUT_APP:-${DEF_APP}}"
-
-DEF_COMPANY="${COMPANY_NAME:-Enterprise AI}"
-read -r -p "6. Company Display Name for Gemini Enterprise [${DEF_COMPANY}]: " INPUT_COMPANY
-COMPANY_NAME="${INPUT_COMPANY:-${DEF_COMPANY}}"
-
-GE_LOCATION="${GE_LOCATION:-global}"
-COUNTRIES_HOST="${COUNTRIES_HOST:-mcp-countries.corp.internal}"
-COUNTRIES_MCP_URL="https://${COUNTRIES_HOST}/mcp"
-HUB_APIGEE_ILB_IP="${HUB_APIGEE_ILB_IP:-10.10.1.30}"
-SB_ILB_IP="${SB_ILB_IP:-10.30.1.10}"
-OAUTH_CLIENT_ID="${OAUTH_CLIENT_ID:-}"
-OAUTH_CLIENT_SECRET="${OAUTH_CLIENT_SECRET:-}"
-
-mkdir -p certs cfg
-save_env
-ok "Saved configuration to ${ENV_FILE}"
-
+if [[ "${UNATTENDED_WORKER}" != "true" ]]; then
 # ------------------------------------------------------------------------------
 # Stage 1: Create Projects, Link Billing, Enable APIs & Configure IAM
 # ------------------------------------------------------------------------------
@@ -303,6 +331,30 @@ if [[ -z "${OAUTH_CLIENT_ID}" || -z "${OAUTH_CLIENT_SECRET}" ]]; then
   ok "OAuth 2.0 client credentials saved to ${ENV_FILE}. Remaining deployment runs 100% unattended."
 else
   ok "Using OAuth 2.0 Client ID from ${ENV_FILE}: ${OAUTH_CLIENT_ID}"
+fi
+
+if [[ "${BACKGROUND_MODE}" == "true" ]]; then
+  nohup "${SCRIPT_DIR}/deploy.sh" --unattended-worker > "${LOG_FILE}" 2>&1 </dev/null &
+  BG_PID=$!
+  echo "${BG_PID}" > "${PID_FILE}"
+  echo ""
+  ok "Detached Stages 3-10 into background worker (PID ${BG_PID})."
+  info "Follow live logs anytime (Ctrl+C stops watching without stopping the job):"
+  echo "    tail -f ${LOG_FILE}"
+  info "Check worker status anytime:"
+  echo "    ps -p \$(cat ${PID_FILE})"
+  exit 0
+fi
+else
+  HUB_PROJECT_NUMBER="$(gcloud projects describe "${HUB_PROJECT_ID}" --format='value(projectNumber)')"
+  APIGEE_PROJECT_NUMBER="$(gcloud projects describe "${APIGEE_PROJECT_ID}" --format='value(projectNumber)')"
+  ORG_ID="$(gcloud projects get-ancestors "${HUB_PROJECT_ID}" --format=json | jq -r '[.[] | select(.type=="organization") | .id][0] // empty')"
+  if [[ -n "${ORG_ID}" ]]; then
+    TRUST_DOMAIN="agents.global.org-${ORG_ID}.system.id.goog"
+  else
+    TRUST_DOMAIN="agents.global.proj-${HUB_PROJECT_NUMBER}.system.id.goog"
+  fi
+  APIGEE_SERVICE_AGENT="service-${APIGEE_PROJECT_NUMBER}@gcp-sa-apigee.iam.gserviceaccount.com"
 fi
 
 # ------------------------------------------------------------------------------
@@ -786,15 +838,24 @@ if [[ "${INST_STATE}" == "MISSING" ]]; then
     }" | jq -r '.name')"
   ELAPSED=0
   while [[ "$(curl -s -H "Authorization: Bearer $(get_token)" "https://apigee.googleapis.com/v1/${OP_INST}" | jq -r '.done // false')" != "true" ]]; do
-    printf "\r  ... Apigee runtime provisioning in progress (%dm %02ds elapsed)" $((ELAPSED/60)) $((ELAPSED%60))
+    if [[ -t 1 ]]; then
+      printf "\r  ... Apigee runtime provisioning in progress (%dm %02ds elapsed)" $((ELAPSED/60)) $((ELAPSED%60))
+    elif (( ELAPSED % 60 == 0 )); then
+      echo "  ... Apigee runtime provisioning in progress ($((ELAPSED/60))m elapsed)"
+    fi
     sleep 30
     ELAPSED=$((ELAPSED+30))
   done
-  echo ""
+  [[ -t 1 ]] && echo ""
 elif [[ "${INST_STATE}" == "CREATING" ]]; then
   info "Apigee instance 'apigee-${REGION}' is currently CREATING; waiting until ACTIVE..."
+  ELAPSED=0
   while [[ "$(curl -s -H "Authorization: Bearer $(get_token)" "${INST_URL}" | jq -r '.state // ""')" != "ACTIVE" ]]; do
+    if [[ ! -t 1 ]] && (( ELAPSED % 60 == 0 )); then
+      echo "  ... Waiting for CREATING Apigee runtime ($((ELAPSED/60))m elapsed)"
+    fi
     sleep 30
+    ELAPSED=$((ELAPSED+30))
   done
 fi
 

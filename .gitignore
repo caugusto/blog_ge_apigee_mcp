@@ -3,6 +3,10 @@
 .env.*
 !.env.example
 
+# Background deployment logs & PID
+deploy.log
+.deploy.pid
+
 # Generated PKI keys/certs and rendered bundles
 certs/
 *.key
@@ -12,6 +16,7 @@ certs/
 *.zip
 apigee_bundles/country-facts-mcp/apiproxy/targets/default.xml
 cfg/allow_custom_mcp_policy.yaml
+cfg/policy_*.yaml
 cfg/iap-authz-ext.yaml
 cfg/uap-allow-registered.json
 verifier_job/ca.crt

@@ -44,7 +44,8 @@ cd blog_ge_apigee_mcp
 
 ```bash
 chmod +x deploy.sh verify.sh teardown.sh
-./deploy.sh
+./deploy.sh --background
+# Collects initial prompts + OAuth client once, then detaches Stages 3-10 to deploy.log (tail -f deploy.log)
 ```
 
 Re-run verification anytime with:
