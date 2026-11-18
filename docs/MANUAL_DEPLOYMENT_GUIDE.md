@@ -67,7 +67,7 @@ fi
 Enable the required APIs across both projects and create the least-privilege service accounts:
 
 ```bash
-# Enable APIs on HUB_PROJECT_ID
+# Enable APIs on HUB_PROJECT_ID (in two batches <= 20 to satisfy Service Usage batch limits)
 gcloud services enable \
   serviceusage.googleapis.com \
   cloudresourcemanager.googleapis.com \
@@ -81,6 +81,9 @@ gcloud services enable \
   agentidentitycredentials.googleapis.com \
   aiplatform.googleapis.com \
   compute.googleapis.com \
+  --project="${HUB_PROJECT_ID}"
+
+gcloud services enable \
   dns.googleapis.com \
   certificatemanager.googleapis.com \
   run.googleapis.com \
@@ -186,13 +189,22 @@ export OAUTH_CLIENT_ID="PASTE_YOUR_OAUTH_CLIENT_ID.apps.googleusercontent.com"
 export OAUTH_CLIENT_SECRET="PASTE_YOUR_OAUTH_CLIENT_SECRET"
 ```
 
-### 2.2 Provision a 30-day Gemini Enterprise free trial license & intranet app via API
+### 2.2 Configure Cloud Identity (`global`), 30-day free trial license & intranet app via API
 
 ```bash
-# 1. Activate a 50-seat 30-day Gemini Enterprise free trial license & auto-assign seats
-YEAR=$(date -u +%Y)
-MONTH=$(date -u +%-m)
-DAY=$(date -u +%-d)
+# 1. Assign Google Identity / Cloud Identity (GSUITE) as the Identity Provider in the global location
+curl -s -X PATCH \
+  "https://${GE_LOCATION}-discoveryengine.googleapis.com/v1alpha/projects/${HUB_PROJECT_ID}/locations/${GE_LOCATION}/aclConfig" \
+  -H "Authorization: Bearer $(get_token)" \
+  -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"name\": \"projects/${HUB_PROJECT_ID}/locations/${GE_LOCATION}/aclConfig\",
+    \"idpConfig\": {\"idpType\": \"GSUITE\"}
+  }" | jq .
+
+# 2. Provision a 50-seat 30-day Gemini Enterprise free trial license & auto-assign seats
+read -r YEAR MONTH DAY <<< "$(python3 -c 'from datetime import datetime, timezone, timedelta; d = datetime.now(timezone.utc) + timedelta(days=1); print(d.year, d.month, d.day)')"
 
 TRIAL_RESP=$(curl -s -X POST \
   "https://${GE_LOCATION}-discoveryengine.googleapis.com/v1alpha/projects/${HUB_PROJECT_ID}/locations/${GE_LOCATION}/licenseConfigs?licenseConfigId=free_trial_gemini" \
@@ -204,8 +216,7 @@ TRIAL_RESP=$(curl -s -X POST \
     \"subscriptionTier\": \"SUBSCRIPTION_TIER_SEARCH_AND_ASSISTANT\",
     \"startDate\": {\"year\": ${YEAR}, \"month\": ${MONTH}, \"day\": ${DAY}},
     \"subscriptionTerm\": \"SUBSCRIPTION_TERM_ONE_MONTH\",
-    \"freeTrial\": true,
-    \"geminiBundle\": true
+    \"freeTrial\": true
   }")
 
 LIC_NAME=$(echo "${TRIAL_RESP}" | jq -r '.name // empty')
@@ -221,7 +232,7 @@ if [[ -n "${LIC_NAME}" ]]; then
     }" | jq .
 fi
 
-# 2. Create initial Discovery Engine DataStore (required by CreateEngineRequest on blank projects)
+# 3. Create initial Discovery Engine DataStore (required by CreateEngineRequest on blank projects)
 curl -s -X POST \
   "https://${GE_LOCATION}-discoveryengine.googleapis.com/v1alpha/projects/${HUB_PROJECT_NUMBER}/locations/${GE_LOCATION}/collections/default_collection/dataStores?dataStoreId=ge-init-store" \
   -H "Authorization: Bearer $(get_token)" \

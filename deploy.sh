@@ -195,12 +195,15 @@ HUB_APIS=(
   iamcredentials.googleapis.com
   logging.googleapis.com
 )
-if ! gcloud services enable "${HUB_APIS[@]}" --project="${HUB_PROJECT_ID}"; then
-  warn "Batch API enablement had a warning; enabling Hub APIs individually..."
-  for api in "${HUB_APIS[@]}"; do
-    gcloud services enable "${api}" --project="${HUB_PROJECT_ID}" 2>/dev/null || warn "Optional/preview API '${api}' skipped."
-  done
-fi
+for ((i=0; i<${#HUB_APIS[@]}; i+=15)); do
+  BATCH=("${HUB_APIS[@]:i:15}")
+  if ! gcloud services enable "${BATCH[@]}" --project="${HUB_PROJECT_ID}"; then
+    warn "Batch API enablement had a warning; enabling batch APIs individually..."
+    for api in "${BATCH[@]}"; do
+      gcloud services enable "${api}" --project="${HUB_PROJECT_ID}" 2>/dev/null || warn "Optional/preview API '${api}' skipped."
+    done
+  fi
+done
 
 if [[ -n "${ORG_ID}" ]]; then
   info "Ensuring custom MCP connectors and IAM v3 UAP bindings are allowed on ${HUB_PROJECT_ID}..."
@@ -303,21 +306,41 @@ else
 fi
 
 # ------------------------------------------------------------------------------
-# Stage 3: Automated Gemini Enterprise Free Trial License & App Provisioning
+# Stage 3: Cloud Identity (global), Free Trial License & Gemini Enterprise App
 # ------------------------------------------------------------------------------
-stage "Stage 3: Gemini Enterprise Trial License & App (${GE_APP_ID})"
+stage "Stage 3: Cloud Identity (${GE_LOCATION}), Trial License & App (${GE_APP_ID})"
 
-ACTIVE_LICENSES="$(curl -s \
+CURRENT_IDP="$(curl -s \
+  -H "Authorization: Bearer $(get_token)" \
+  -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" \
+  "https://${GE_LOCATION}-discoveryengine.googleapis.com/v1alpha/projects/${HUB_PROJECT_ID}/locations/${GE_LOCATION}/aclConfig" \
+  | jq -r '.idpConfig.idpType // empty')"
+
+if [[ "${CURRENT_IDP}" != "GSUITE" ]]; then
+  info "Assigning Cloud Identity / Google Workspace (GSUITE) as Identity Provider in '${GE_LOCATION}'..."
+  curl -s -X PATCH \
+    "https://${GE_LOCATION}-discoveryengine.googleapis.com/v1alpha/projects/${HUB_PROJECT_ID}/locations/${GE_LOCATION}/aclConfig" \
+    -H "Authorization: Bearer $(get_token)" \
+    -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" \
+    -H "Content-Type: application/json" \
+    -d "{
+      \"name\": \"projects/${HUB_PROJECT_ID}/locations/${GE_LOCATION}/aclConfig\",
+      \"idpConfig\": {\"idpType\": \"GSUITE\"}
+    }" >/dev/null
+  ok "Configured '${GE_LOCATION}' aclConfig -> idpType: GSUITE."
+else
+  ok "Cloud Identity ('${GE_LOCATION}' aclConfig -> GSUITE) already configured."
+fi
+
+EXISTING_LICENSES="$(curl -s \
   -H "Authorization: Bearer $(get_token)" \
   -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" \
   "https://${GE_LOCATION}-discoveryengine.googleapis.com/v1alpha/projects/${HUB_PROJECT_ID}/locations/${GE_LOCATION}/licenseConfigs" \
-  | jq -r '[.licenseConfigs[]? | select(.state == "ACTIVE")] | length')"
+  | jq -r '[.licenseConfigs[]? | select(.state == "ACTIVE" or .state == "NOT_STARTED")] | length')"
 
-if [[ "${ACTIVE_LICENSES}" == "0" ]]; then
-  info "No active Gemini Enterprise license found on ${HUB_PROJECT_ID}; provisioning 30-day free trial license..."
-  YEAR="$(date -u +%Y)"
-  MONTH="$(date -u +%-m)"
-  DAY="$(date -u +%-d)"
+if [[ "${EXISTING_LICENSES}" == "0" ]]; then
+  info "No Gemini Enterprise license found on ${HUB_PROJECT_ID}; provisioning 50-seat 30-day free trial license..."
+  read -r YEAR MONTH DAY <<< "$(python3 -c 'from datetime import datetime, timezone, timedelta; d = datetime.now(timezone.utc) + timedelta(days=1); print(d.year, d.month, d.day)')"
 
   TRIAL_RESP="$(curl -s -X POST \
     "https://${GE_LOCATION}-discoveryengine.googleapis.com/v1alpha/projects/${HUB_PROJECT_ID}/locations/${GE_LOCATION}/licenseConfigs?licenseConfigId=free_trial_gemini" \
@@ -329,13 +352,16 @@ if [[ "${ACTIVE_LICENSES}" == "0" ]]; then
       \"subscriptionTier\": \"SUBSCRIPTION_TIER_SEARCH_AND_ASSISTANT\",
       \"startDate\": {\"year\": ${YEAR}, \"month\": ${MONTH}, \"day\": ${DAY}},
       \"subscriptionTerm\": \"SUBSCRIPTION_TERM_ONE_MONTH\",
-      \"freeTrial\": true,
-      \"geminiBundle\": true
+      \"freeTrial\": true
     }")"
 
   if echo "${TRIAL_RESP}" | jq -e '.name' >/dev/null 2>&1; then
     LIC_NAME="$(echo "${TRIAL_RESP}" | jq -r '.name')"
-    ok "Activated Gemini Enterprise 30-day free trial (${LIC_NAME})."
+    LIC_STATE="$(echo "${TRIAL_RESP}" | jq -r '.state // "UNKNOWN"')"
+    ok "Provisioned Gemini Enterprise 30-day free trial (${LIC_NAME}, state=${LIC_STATE})."
+    if [[ "${LIC_STATE}" == "NOT_STARTED" ]]; then
+      info "Note: REST-created trials start at next UTC day (${YEAR}-${MONTH}-${DAY}); to activate seats immediately today, click Start free trial at https://console.cloud.google.com/gen-app-builder/settings/license?project=${HUB_PROJECT_ID}"
+    fi
     curl -s -X PATCH \
       "https://${GE_LOCATION}-discoveryengine.googleapis.com/v1alpha/projects/${HUB_PROJECT_ID}/locations/${GE_LOCATION}/userStores/default_user_store?updateMask=defaultLicenseConfig,enableLicenseAutoRegister" \
       -H "Authorization: Bearer $(get_token)" \
@@ -347,10 +373,10 @@ if [[ "${ACTIVE_LICENSES}" == "0" ]]; then
       }" >/dev/null || true
   else
     warn "Free trial API response: $(echo "${TRIAL_RESP}" | tr -d '\n' | cut -c1-220)"
-    warn "Continuing (billing account may already hold an org-level Gemini Enterprise entitlement)."
+    warn "Continuing (you can also enable a trial at https://console.cloud.google.com/gen-app-builder/settings/license?project=${HUB_PROJECT_ID})."
   fi
 else
-  ok "Found ${ACTIVE_LICENSES} active Gemini Enterprise license config(s) on ${HUB_PROJECT_ID}."
+  ok "Found ${EXISTING_LICENSES} Gemini Enterprise license config(s) on ${HUB_PROJECT_ID}."
 fi
 
 # Ensure initial DataStore exists so CreateEngineRequest succeeds on blank projects
