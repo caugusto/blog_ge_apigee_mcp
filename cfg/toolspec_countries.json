@@ -1,0 +1,62 @@
+{
+  "tools": [
+    {
+      "name": "list_countries",
+      "description": "List countries in the Country Facts catalog with ISO codes, capitals, regions, populations, currencies, and headline facts.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "region": {
+            "type": "string",
+            "description": "Optional geographic region filter (Asia, Americas, Europe, Africa, Oceania)."
+          }
+        }
+      },
+      "annotations": {
+        "title": "List Countries",
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "get_country_facts",
+      "description": "Fetch detailed geographic, demographic, currency, language, timezone, and curated facts for a specific country by name or ISO code (e.g., japan, brazil, norway, kenya, canada, australia).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "country": {
+            "type": "string",
+            "description": "Country name, ID, or ISO-3166 alpha-3 code (e.g., japan, JPN, brazil, BRA, norway, kenya, canada, australia)."
+          }
+        },
+        "required": [
+          "country"
+        ]
+      },
+      "annotations": {
+        "title": "Get Country Facts",
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "get_authenticated_caller",
+      "description": "Return the verified Google OAuth 2.0 caller identity, Apigee X proxy mediation metadata, and hosting GCP project of the Country Facts MCP server.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      },
+      "annotations": {
+        "title": "Get Country MCP & Apigee Caller Info",
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    }
+  ]
+}

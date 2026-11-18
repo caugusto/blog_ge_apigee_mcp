@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<APIProxy revision="1" name="country-facts-mcp">
+  <DisplayName>Country Facts Internal MCP Proxy</DisplayName>
+  <Description>Internal Apigee X MCP proxy mediating Gemini Enterprise StreamableHTTP calls to Cloud Run mcp-countries-poc over Private Service Connect with OAuth2 and Cloud Run OIDC credential translation.</Description>
+  <ProxyEndpoints>
+    <ProxyEndpoint>default</ProxyEndpoint>
+  </ProxyEndpoints>
+  <TargetEndpoints>
+    <TargetEndpoint>default</TargetEndpoint>
+  </TargetEndpoints>
+</APIProxy>

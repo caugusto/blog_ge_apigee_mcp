@@ -1,0 +1,23 @@
+# Local configuration & secrets (never commit)
+.env
+.env.*
+!.env.example
+
+# Generated PKI keys/certs and rendered bundles
+certs/
+*.key
+*.csr
+*.crt
+*.srl
+*.zip
+apigee_bundles/country-facts-mcp/apiproxy/targets/default.xml
+cfg/allow_custom_mcp_policy.yaml
+cfg/iap-authz-ext.yaml
+cfg/uap-allow-registered.json
+verifier_job/ca.crt
+
+# Python & OS artifacts
+__pycache__/
+*.py[cod]
+.venv/
+.DS_Store
