@@ -17,31 +17,319 @@ PID_FILE="${SCRIPT_DIR}/.deploy.pid"
 BACKGROUND_MODE=false
 UNATTENDED_WORKER=false
 RECONFIGURE=false
+REBUILD_MCP=false
+REDEPLOY_PROXY=false
+WORKER_EXTRA_ARGS=()
 for arg in "$@"; do
   case "${arg}" in
     --background|-b) BACKGROUND_MODE=true ;;
     --unattended-worker) UNATTENDED_WORKER=true ;;
     --reconfigure) RECONFIGURE=true ;;
+    --rebuild-mcp) REBUILD_MCP=true; WORKER_EXTRA_ARGS+=("--rebuild-mcp") ;;
+    --redeploy-proxy) REDEPLOY_PROXY=true; WORKER_EXTRA_ARGS+=("--redeploy-proxy") ;;
   esac
 done
 
 # ------------------------------------------------------------------------------
-# Pretty logging helpers
+# Pretty logging, LRO & Idempotency helpers
 # ------------------------------------------------------------------------------
 if [[ -t 1 ]]; then
   BLUE="\033[1;34m"; GREEN="\033[1;32m"; YELLOW="\033[1;33m"; RED="\033[1;31m"; NC="\033[0m"
 else
   BLUE=""; GREEN=""; YELLOW=""; RED=""; NC=""
+  export CLOUDSDK_CORE_DISABLE_COLOR=1
 fi
 
 info()  { echo -e "${BLUE}[INFO]${NC}  $*"; }
 ok()    { echo -e "${GREEN}[OK]${NC}    $*"; }
+skip()  { echo -e "${GREEN}[SKIP]${NC}  $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 err()   { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 stage() { echo -e "\n${BLUE}==============================================================================${NC}\n${BLUE} $*${NC}\n${BLUE}==============================================================================${NC}"; }
 
+rm -f cfg/.iam_*.json 2>/dev/null || true
+trap 'rm -f cfg/.iam_*.json 2>/dev/null || true' EXIT
+
+if [[ "${UNATTENDED_WORKER}" != "true" && -f "${PID_FILE}" ]]; then
+  OLD_PID="$(cat "${PID_FILE}" 2>/dev/null || true)"
+  if [[ -n "${OLD_PID}" ]] && kill -0 "${OLD_PID}" 2>/dev/null; then
+    warn "Stopping previous background worker (PID ${OLD_PID})..."
+    kill "${OLD_PID}" 2>/dev/null || true
+    sleep 1
+  fi
+  rm -f "${PID_FILE}"
+fi
+
 get_token() {
   gcloud auth print-access-token 2>/dev/null
+}
+
+ensure_project_apis() {
+  local proj="$1"
+  shift
+  local desired_apis=("$@")
+  local enabled_list
+  enabled_list="$(gcloud services list --enabled --project="${proj}" --format='value(config.name)' 2>/dev/null || true)"
+  local missing_apis=()
+  for api in "${desired_apis[@]}"; do
+    if ! grep -Fxq "${api}" <<< "${enabled_list}"; then
+      missing_apis+=("${api}")
+    fi
+  done
+  if [[ "${#missing_apis[@]}" -eq 0 ]]; then
+    skip "All ${#desired_apis[@]} required APIs already enabled on '${proj}'."
+    return 0
+  fi
+  info "Enabling ${#missing_apis[@]} missing API(s) on '${proj}': ${missing_apis[*]}..."
+  for ((i=0; i<${#missing_apis[@]}; i+=15)); do
+    local batch=("${missing_apis[@]:i:15}")
+    if ! gcloud services enable "${batch[@]}" --project="${proj}"; then
+      warn "Batch API enablement had a warning; enabling batch APIs individually..."
+      for api in "${batch[@]}"; do
+        gcloud services enable "${api}" --project="${proj}" 2>/dev/null || warn "Optional/preview API '${api}' skipped."
+      done
+    fi
+  done
+  ok "Enabled missing APIs on '${proj}'."
+}
+
+get_project_iam_cache() {
+  local proj="$1"
+  local cache_file="cfg/.iam_${proj}.json"
+  if [[ ! -f "${cache_file}" ]]; then
+    gcloud projects get-iam-policy "${proj}" --format=json > "${cache_file}"
+  fi
+  echo "${cache_file}"
+}
+
+project_has_member_any_role() {
+  local proj="$1"
+  local member="$2"
+  local cache_file count
+  cache_file="$(get_project_iam_cache "${proj}")"
+  count="$(jq -r --arg m "${member}" '[.bindings[]? | select(.members[]? == $m)] | length' "${cache_file}" 2>/dev/null || echo "0")"
+  [[ "${count}" != "0" ]]
+}
+
+ensure_project_iam_roles() {
+  local proj="$1"
+  local member="$2"
+  shift 2
+  local cache_file
+  cache_file="$(get_project_iam_cache "${proj}")"
+  for role in "$@"; do
+    local has_role
+    has_role="$(jq -r --arg r "${role}" --arg m "${member}" \
+      '[.bindings[]? | select(.role == $r and (.condition == null) and (.members[]? == $m))] | length' \
+      "${cache_file}" 2>/dev/null || echo "0")"
+    if [[ "${has_role}" != "0" ]]; then
+      skip "IAM ${role} already granted to ${member} on '${proj}'."
+    else
+      info "Granting ${role} to ${member} on '${proj}'..."
+      if gcloud projects add-iam-policy-binding "${proj}" \
+        --member="${member}" \
+        --role="${role}" \
+        --condition=None --quiet --format=json > "${cache_file}.tmp" 2>/dev/null; then
+        mv "${cache_file}.tmp" "${cache_file}"
+      else
+        rm -f "${cache_file}.tmp"
+        warn "Could not grant ${role} to ${member} on '${proj}' (continuing)."
+      fi
+    fi
+  done
+}
+
+ensure_sa_iam_roles() {
+  local proj="$1"
+  local sa_email="$2"
+  local member="$3"
+  shift 3
+  local policy_json
+  policy_json="$(gcloud iam service-accounts get-iam-policy "${sa_email}" --project="${proj}" --format=json 2>/dev/null || echo '{}')"
+  for role in "$@"; do
+    local has_role
+    has_role="$(echo "${policy_json}" | jq -r --arg r "${role}" --arg m "${member}" \
+      '[.bindings[]? | select(.role == $r and (.members[]? == $m))] | length' 2>/dev/null || echo "0")"
+    if [[ "${has_role}" != "0" ]]; then
+      skip "Service Account IAM ${role} already granted on '${sa_email}'."
+    else
+      info "Granting ${role} on '${sa_email}' to ${member}..."
+      policy_json="$(gcloud iam service-accounts add-iam-policy-binding "${sa_email}" \
+        --member="${member}" \
+        --role="${role}" \
+        --project="${proj}" --format=json)"
+    fi
+  done
+}
+
+ensure_run_invoker() {
+  local proj="$1"
+  local region="$2"
+  local svc="$3"
+  local member="$4"
+  local policy_json has_role
+  policy_json="$(gcloud run services get-iam-policy "${svc}" --region="${region}" --project="${proj}" --format=json 2>/dev/null || echo '{}')"
+  has_role="$(echo "${policy_json}" | jq -r --arg m "${member}" \
+    '[.bindings[]? | select(.role == "roles/run.invoker" and (.members[]? == $m))] | length' 2>/dev/null || echo "0")"
+  if [[ "${has_role}" != "0" ]]; then
+    skip "Cloud Run roles/run.invoker already granted to ${member} on '${svc}'."
+  else
+    info "Granting Cloud Run roles/run.invoker to ${member} on '${svc}'..."
+    gcloud run services add-iam-policy-binding "${svc}" \
+      --region="${region}" \
+      --project="${proj}" \
+      --member="${member}" \
+      --role="roles/run.invoker" >/dev/null
+    ok "Granted roles/run.invoker on '${svc}'."
+  fi
+}
+
+ensure_kms_iam_role() {
+  local proj="$1"
+  local region="$2"
+  local keyring="$3"
+  local key="$4"
+  local member="$5"
+  local role="$6"
+  local policy_json has_role
+  policy_json="$(gcloud kms keys get-iam-policy "${key}" --keyring="${keyring}" --location="${region}" --project="${proj}" --format=json 2>/dev/null || echo '{}')"
+  has_role="$(echo "${policy_json}" | jq -r --arg r "${role}" --arg m "${member}" \
+    '[.bindings[]? | select(.role == $r and (.members[]? == $m))] | length' 2>/dev/null || echo "0")"
+  if [[ "${has_role}" != "0" ]]; then
+    skip "KMS IAM ${role} already granted on key '${key}'."
+  else
+    info "Granting ${role} on KMS key '${key}' to ${member}..."
+    gcloud kms keys add-iam-policy-binding "${key}" \
+      --keyring="${keyring}" --location="${region}" \
+      --member="${member}" \
+      --role="${role}" \
+      --project="${proj}" >/dev/null
+    ok "Granted ${role} on KMS key '${key}'."
+  fi
+}
+
+wait_apigee_idle() {
+  local announced=false
+  local elapsed=0
+  for _ in {1..360}; do
+    local in_prog
+    in_prog="$(curl -s -H "Authorization: Bearer $(get_token)" \
+      "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}/operations" \
+      | jq -r '[.operations[]? | select(.metadata.state == "IN_PROGRESS")] | length' 2>/dev/null || echo "0")"
+    [[ "${in_prog:-0}" == "0" ]] && return 0
+    if [[ "${announced}" == "false" ]]; then
+      info "Waiting for ${in_prog} in-progress Apigee operation(s) on '${APIGEE_PROJECT_ID}' to settle..."
+      announced=true
+    elif (( elapsed > 0 && elapsed % 60 == 0 )); then
+      echo "  ... Apigee operation still in progress ($((elapsed/60))m elapsed)"
+    fi
+    sleep 5
+    elapsed=$((elapsed + 5))
+  done
+}
+
+wait_apigee_op() {
+  local resp_json="$1"
+  local label="$2"
+  local sleep_sec="${3:-10}"
+  if echo "${resp_json}" | jq -e '.error' >/dev/null 2>&1; then
+    err "Failed starting ${label}: $(echo "${resp_json}" | jq -c '.error')"
+    exit 1
+  fi
+  local op_name
+  op_name="$(echo "${resp_json}" | jq -r '.name // empty' 2>/dev/null || true)"
+  if [[ -z "${op_name}" || "${op_name}" == "null" ]]; then
+    err "Failed starting ${label}: ${resp_json}"
+    exit 1
+  fi
+  # Some Apigee endpoints return the created resource synchronously instead of an Operation
+  if [[ "${op_name}" != organizations/*/operations/* ]]; then
+    return 0
+  fi
+  local elapsed=0
+  while true; do
+    local poll_json done_flag
+    poll_json="$(curl -s -H "Authorization: Bearer $(get_token)" "https://apigee.googleapis.com/v1/${op_name}")"
+    done_flag="$(echo "${poll_json}" | jq -r '.done // false' 2>/dev/null || echo "false")"
+    if [[ "${done_flag}" == "true" ]]; then
+      if echo "${poll_json}" | jq -e '.error' >/dev/null 2>&1; then
+        err "${label} failed: $(echo "${poll_json}" | jq -c '.error')"
+        exit 1
+      fi
+      [[ -t 1 && "${sleep_sec}" -ge 20 ]] && echo ""
+      return 0
+    fi
+    if (( sleep_sec >= 20 )); then
+      if [[ -t 1 ]]; then
+        printf "\r  ... %s in progress (%dm %02ds elapsed)" "${label}" $((elapsed/60)) $((elapsed%60))
+      elif (( elapsed % 60 == 0 )); then
+        echo "  ... ${label} in progress ($((elapsed/60))m elapsed)"
+      fi
+    fi
+    sleep "${sleep_sec}"
+    elapsed=$((elapsed + sleep_sec))
+  done
+}
+
+apigee_post_and_wait() {
+  local url="$1"
+  local body="$2"
+  local label="$3"
+  local sleep_sec="${4:-10}"
+  local resp=""
+  for attempt in 1 2 3; do
+    wait_apigee_idle
+    resp="$(curl -s -X POST "${url}" \
+      -H "Authorization: Bearer $(get_token)" \
+      -H "Content-Type: application/json" \
+      -d "${body}")"
+    if echo "${resp}" | jq -e '.error' >/dev/null 2>&1; then
+      local code
+      code="$(echo "${resp}" | jq -r '.error.code // 0' 2>/dev/null || echo "0")"
+      if [[ "${attempt}" -lt 3 && ( "${code}" == "400" || "${code}" == "409" || "${code}" == "503" ) ]]; then
+        warn "${label} temporarily locked by Apigee control plane (HTTP ${code}); retrying in 10s (attempt ${attempt}/3)..."
+        sleep 10
+        continue
+      fi
+    fi
+    break
+  done
+  wait_apigee_op "${resp}" "${label}" "${sleep_sec}"
+  sleep 3
+  wait_apigee_idle
+}
+
+wait_gcp_op() {
+  local api_base="$1"
+  local resp_json="$2"
+  local label="$3"
+  local sleep_sec="${4:-5}"
+  if echo "${resp_json}" | jq -e '.error' >/dev/null 2>&1; then
+    err "Failed starting ${label}: $(echo "${resp_json}" | jq -c '.error')"
+    exit 1
+  fi
+  local op_name
+  op_name="$(echo "${resp_json}" | jq -r '.name // empty' 2>/dev/null || true)"
+  if [[ -z "${op_name}" || "${op_name}" == "null" ]]; then
+    err "Failed starting ${label}: ${resp_json}"
+    exit 1
+  fi
+  if [[ "${op_name}" != */operations/* ]]; then
+    return 0
+  fi
+  while true; do
+    local poll_json done_flag
+    poll_json="$(curl -s -H "Authorization: Bearer $(get_token)" -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" "${api_base}/${op_name}")"
+    done_flag="$(echo "${poll_json}" | jq -r '.done // false' 2>/dev/null || echo "false")"
+    if [[ "${done_flag}" == "true" ]]; then
+      if echo "${poll_json}" | jq -e '.error' >/dev/null 2>&1; then
+        err "${label} failed: $(echo "${poll_json}" | jq -c '.error')"
+        exit 1
+      fi
+      return 0
+    fi
+    sleep "${sleep_sec}"
+  done
 }
 
 save_env() {
@@ -175,17 +463,25 @@ stage "Stage 1: Projects, Billing, APIs & Service Accounts"
 for PROJ in "${HUB_PROJECT_ID}" "${APIGEE_PROJECT_ID}"; do
   P_STATE="$(gcloud projects describe "${PROJ}" --format='value(lifecycleState)' 2>/dev/null || echo 'MISSING')"
   if [[ "${P_STATE}" == "ACTIVE" ]]; then
-    ok "Project '${PROJ}' already exists and is ACTIVE."
+    skip "Project '${PROJ}' already exists (ACTIVE)."
   elif [[ "${P_STATE}" == "DELETE_REQUESTED" ]]; then
-    err "Project '${PROJ}' is in DELETE_REQUESTED state. Run 'gcloud projects undelete ${PROJ}' or re-run ./deploy.sh with a new project ID."
+    err "Project '${PROJ}' is in DELETE_REQUESTED state. Run 'gcloud projects undelete ${PROJ}' or re-run ./deploy.sh --reconfigure with a new project ID."
     exit 1
   else
     info "Creating project '${PROJ}'..."
     gcloud projects create "${PROJ}"
     ok "Created project '${PROJ}'."
   fi
-  info "Linking billing account '${BILLING_ACCOUNT_ID}' to '${PROJ}'..."
-  gcloud billing projects link "${PROJ}" --billing-account="${BILLING_ACCOUNT_ID}" >/dev/null
+
+  CUR_BILLING="$(gcloud billing projects describe "${PROJ}" --format='value(billingAccountName)' 2>/dev/null || true)"
+  CUR_BILLING_ENABLED="$(gcloud billing projects describe "${PROJ}" --format='value(billingEnabled)' 2>/dev/null || true)"
+  if [[ "${CUR_BILLING}" == "billingAccounts/${BILLING_ACCOUNT_ID}" && ( "${CUR_BILLING_ENABLED}" == "True" || "${CUR_BILLING_ENABLED}" == "true" ) ]]; then
+    skip "Billing account '${BILLING_ACCOUNT_ID}' already linked to '${PROJ}'."
+  else
+    info "Linking billing account '${BILLING_ACCOUNT_ID}' to '${PROJ}'..."
+    gcloud billing projects link "${PROJ}" --billing-account="${BILLING_ACCOUNT_ID}" >/dev/null
+    ok "Linked billing account '${BILLING_ACCOUNT_ID}' to '${PROJ}'."
+  fi
 done
 
 HUB_PROJECT_NUMBER="$(gcloud projects describe "${HUB_PROJECT_ID}" --format='value(projectNumber)')"
@@ -198,7 +494,6 @@ else
   TRUST_DOMAIN="agents.global.proj-${HUB_PROJECT_NUMBER}.system.id.goog"
 fi
 
-info "Enabling Google Cloud APIs on Hub project (${HUB_PROJECT_ID})..."
 HUB_APIS=(
   serviceusage.googleapis.com
   cloudresourcemanager.googleapis.com
@@ -223,33 +518,30 @@ HUB_APIS=(
   iamcredentials.googleapis.com
   logging.googleapis.com
 )
-for ((i=0; i<${#HUB_APIS[@]}; i+=15)); do
-  BATCH=("${HUB_APIS[@]:i:15}")
-  if ! gcloud services enable "${BATCH[@]}" --project="${HUB_PROJECT_ID}"; then
-    warn "Batch API enablement had a warning; enabling batch APIs individually..."
-    for api in "${BATCH[@]}"; do
-      gcloud services enable "${api}" --project="${HUB_PROJECT_ID}" 2>/dev/null || warn "Optional/preview API '${api}' skipped."
-    done
-  fi
-done
+ensure_project_apis "${HUB_PROJECT_ID}" "${HUB_APIS[@]}"
 
 if [[ -n "${ORG_ID}" ]]; then
-  info "Ensuring custom MCP connectors and IAM v3 UAP bindings are allowed on ${HUB_PROJECT_ID}..."
   for CONSTRAINT in \
     discoveryengine.managed.disableCustomMcpServerConnector \
     iam.managed.disableAccessPolicyBinding; do
-    cat > "cfg/policy_${CONSTRAINT}.yaml" <<EOF
+    ALREADY_UNENFORCED="$(gcloud org-policies describe "${CONSTRAINT}" --project="${HUB_PROJECT_ID}" --format=json 2>/dev/null \
+      | jq -r '[.spec.rules[]? | select(.enforce == false)] | length' 2>/dev/null || echo "0")"
+    if [[ "${ALREADY_UNENFORCED}" != "0" ]]; then
+      skip "Org policy override '${CONSTRAINT}' (enforce=false) already set on '${HUB_PROJECT_ID}'."
+    else
+      info "Setting org policy override '${CONSTRAINT}' (enforce=false) on '${HUB_PROJECT_ID}'..."
+      cat > "cfg/policy_${CONSTRAINT}.yaml" <<EOF
 name: projects/${HUB_PROJECT_NUMBER}/policies/${CONSTRAINT}
 spec:
   rules:
   - enforce: false
 EOF
-    gcloud org-policies set-policy "cfg/policy_${CONSTRAINT}.yaml" --project="${HUB_PROJECT_ID}" >/dev/null 2>&1 || \
-      warn "Could not override ${CONSTRAINT} (may already be allowed or require Org Policy Admin)."
+      gcloud org-policies set-policy "cfg/policy_${CONSTRAINT}.yaml" --project="${HUB_PROJECT_ID}" >/dev/null 2>&1 || \
+        warn "Could not override ${CONSTRAINT} (may already be allowed or require Org Policy Admin)."
+    fi
   done
 fi
 
-info "Enabling Google Cloud APIs on Apigee & MCP project (${APIGEE_PROJECT_ID})..."
 APIGEE_APIS=(
   serviceusage.googleapis.com
   cloudresourcemanager.googleapis.com
@@ -264,44 +556,58 @@ APIGEE_APIS=(
   iamcredentials.googleapis.com
   logging.googleapis.com
 )
-gcloud services enable "${APIGEE_APIS[@]}" --project="${APIGEE_PROJECT_ID}"
-
-for SVC in apigee.googleapis.com cloudkms.googleapis.com compute.googleapis.com cloudbuild.googleapis.com; do
-  gcloud beta services identity create --service="${SVC}" --project="${APIGEE_PROJECT_ID}" >/dev/null 2>&1 || true
-done
-for SVC in networkservices.googleapis.com discoveryengine.googleapis.com compute.googleapis.com cloudbuild.googleapis.com; do
-  gcloud beta services identity create --service="${SVC}" --project="${HUB_PROJECT_ID}" >/dev/null 2>&1 || true
-done
-
-# Grant Cloud Build source-deploy permissions to Default Compute SAs (required when iam.automaticIamGrantsForDefaultServiceAccounts is enforced)
-for PAIR in "${HUB_PROJECT_ID}:${HUB_PROJECT_NUMBER}" "${APIGEE_PROJECT_ID}:${APIGEE_PROJECT_NUMBER}"; do
-  IFS=":" read -r P_ID P_NUM <<< "${PAIR}"
-  for BUILD_ROLE in roles/storage.admin roles/artifactregistry.writer roles/logging.logWriter roles/cloudbuild.builds.builder; do
-    gcloud projects add-iam-policy-binding "${P_ID}" \
-      --member="serviceAccount:${P_NUM}-compute@developer.gserviceaccount.com" \
-      --role="${BUILD_ROLE}" --condition=None --quiet >/dev/null 2>&1 || true
-  done
-done
+ensure_project_apis "${APIGEE_PROJECT_ID}" "${APIGEE_APIS[@]}"
 
 APIGEE_SERVICE_AGENT="service-${APIGEE_PROJECT_NUMBER}@gcp-sa-apigee.iam.gserviceaccount.com"
+
+if ! project_has_member_any_role "${APIGEE_PROJECT_ID}" "serviceAccount:${APIGEE_SERVICE_AGENT}"; then
+  info "Initializing Google-managed service agents on '${APIGEE_PROJECT_ID}'..."
+  for SVC in apigee.googleapis.com cloudkms.googleapis.com compute.googleapis.com cloudbuild.googleapis.com; do
+    gcloud beta services identity create --service="${SVC}" --project="${APIGEE_PROJECT_ID}" >/dev/null 2>&1 || true
+  done
+  rm -f "cfg/.iam_${APIGEE_PROJECT_ID}.json"
+else
+  skip "Google-managed service agents already initialized on '${APIGEE_PROJECT_ID}'."
+fi
+
+if ! project_has_member_any_role "${HUB_PROJECT_ID}" "serviceAccount:service-${HUB_PROJECT_NUMBER}@gcp-sa-discoveryengine.iam.gserviceaccount.com"; then
+  info "Initializing Google-managed service agents on '${HUB_PROJECT_ID}'..."
+  for SVC in networkservices.googleapis.com discoveryengine.googleapis.com compute.googleapis.com cloudbuild.googleapis.com; do
+    gcloud beta services identity create --service="${SVC}" --project="${HUB_PROJECT_ID}" >/dev/null 2>&1 || true
+  done
+  rm -f "cfg/.iam_${HUB_PROJECT_ID}.json"
+else
+  skip "Google-managed service agents already initialized on '${HUB_PROJECT_ID}'."
+fi
+
+# Grant Cloud Build source-deploy permissions to Default Compute SAs (when iam.automaticIamGrantsForDefaultServiceAccounts is enforced)
+for PAIR in "${HUB_PROJECT_ID}:${HUB_PROJECT_NUMBER}" "${APIGEE_PROJECT_ID}:${APIGEE_PROJECT_NUMBER}"; do
+  IFS=":" read -r P_ID P_NUM <<< "${PAIR}"
+  ensure_project_iam_roles "${P_ID}" "serviceAccount:${P_NUM}-compute@developer.gserviceaccount.com" \
+    roles/storage.admin \
+    roles/artifactregistry.writer \
+    roles/logging.logWriter \
+    roles/cloudbuild.builds.builder
+done
 
 for SA_SPEC in \
   "${APIGEE_PROJECT_ID}:sa-mcp-countries:Country Facts Internal MCP Runtime SA" \
   "${APIGEE_PROJECT_ID}:sa-apigee-invoker:Apigee X Southbound Cloud Run Invoker SA" \
   "${HUB_PROJECT_ID}:sa-mcp-verifier:In-VPC MCP Verifier SA"; do
   IFS=":" read -r P_ID SA_NAME SA_DESC <<< "${SA_SPEC}"
-  if ! gcloud iam service-accounts describe "${SA_NAME}@${P_ID}.iam.gserviceaccount.com" --project="${P_ID}" >/dev/null 2>&1; then
+  if gcloud iam service-accounts describe "${SA_NAME}@${P_ID}.iam.gserviceaccount.com" --project="${P_ID}" >/dev/null 2>&1; then
+    skip "Service account '${SA_NAME}@${P_ID}.iam.gserviceaccount.com' already exists."
+  else
+    info "Creating service account '${SA_NAME}@${P_ID}.iam.gserviceaccount.com'..."
     gcloud iam service-accounts create "${SA_NAME}" --display-name="${SA_DESC}" --project="${P_ID}"
   fi
 done
 
-for ROLE in roles/iam.serviceAccountUser roles/iam.serviceAccountTokenCreator; do
-  gcloud iam service-accounts add-iam-policy-binding \
-    "sa-apigee-invoker@${APIGEE_PROJECT_ID}.iam.gserviceaccount.com" \
-    --member="serviceAccount:${APIGEE_SERVICE_AGENT}" \
-    --role="${ROLE}" \
-    --project="${APIGEE_PROJECT_ID}" >/dev/null
-done
+ensure_sa_iam_roles "${APIGEE_PROJECT_ID}" \
+  "sa-apigee-invoker@${APIGEE_PROJECT_ID}.iam.gserviceaccount.com" \
+  "serviceAccount:${APIGEE_SERVICE_AGENT}" \
+  roles/iam.serviceAccountUser \
+  roles/iam.serviceAccountTokenCreator
 
 # ------------------------------------------------------------------------------
 # Stage 2: Guided Web OAuth 2.0 Client Collection (Browser-Only Security Control)
@@ -330,11 +636,11 @@ if [[ -z "${OAUTH_CLIENT_ID}" || -z "${OAUTH_CLIENT_SECRET}" ]]; then
   save_env
   ok "OAuth 2.0 client credentials saved to ${ENV_FILE}. Remaining deployment runs 100% unattended."
 else
-  ok "Using OAuth 2.0 Client ID from ${ENV_FILE}: ${OAUTH_CLIENT_ID}"
+  skip "OAuth 2.0 Client already configured in ${ENV_FILE} (${OAUTH_CLIENT_ID})."
 fi
 
 if [[ "${BACKGROUND_MODE}" == "true" ]]; then
-  nohup "${SCRIPT_DIR}/deploy.sh" --unattended-worker > "${LOG_FILE}" 2>&1 </dev/null &
+  nohup "${SCRIPT_DIR}/deploy.sh" --unattended-worker ${WORKER_EXTRA_ARGS[@]+"${WORKER_EXTRA_ARGS[@]}"} > "${LOG_FILE}" 2>&1 </dev/null &
   BG_PID=$!
   echo "${BG_PID}" > "${PID_FILE}"
   echo ""
@@ -366,7 +672,7 @@ CURRENT_IDP="$(curl -s \
   -H "Authorization: Bearer $(get_token)" \
   -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" \
   "https://${GE_LOCATION}-discoveryengine.googleapis.com/v1alpha/projects/${HUB_PROJECT_ID}/locations/${GE_LOCATION}/aclConfig" \
-  | jq -r '.idpConfig.idpType // empty')"
+  | jq -r '.idpConfig.idpType // empty' 2>/dev/null || true)"
 
 if [[ "${CURRENT_IDP}" != "GSUITE" ]]; then
   info "Assigning Cloud Identity / Google Workspace (GSUITE) as Identity Provider in '${GE_LOCATION}'..."
@@ -381,14 +687,14 @@ if [[ "${CURRENT_IDP}" != "GSUITE" ]]; then
     }" >/dev/null
   ok "Configured '${GE_LOCATION}' aclConfig -> idpType: GSUITE."
 else
-  ok "Cloud Identity ('${GE_LOCATION}' aclConfig -> GSUITE) already configured."
+  skip "Cloud Identity ('${GE_LOCATION}' aclConfig -> GSUITE) already configured."
 fi
 
 EXISTING_LICENSES="$(curl -s \
   -H "Authorization: Bearer $(get_token)" \
   -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" \
   "https://${GE_LOCATION}-discoveryengine.googleapis.com/v1alpha/projects/${HUB_PROJECT_ID}/locations/${GE_LOCATION}/licenseConfigs" \
-  | jq -r '[.licenseConfigs[]? | select(.state == "ACTIVE" or .state == "NOT_STARTED")] | length')"
+  | jq -r '[.licenseConfigs[]? | select(.state == "ACTIVE" or .state == "NOT_STARTED")] | length' 2>/dev/null || echo "0")"
 
 if [[ "${EXISTING_LICENSES}" == "0" ]]; then
   info "No Gemini Enterprise license found on ${HUB_PROJECT_ID}; provisioning 50-seat 30-day free trial license..."
@@ -428,7 +734,7 @@ if [[ "${EXISTING_LICENSES}" == "0" ]]; then
     warn "Continuing (if your billing account already used its 1-time trial, enable a subscription in Cloud Console -> Gemini Enterprise -> Subscriptions: https://console.cloud.google.com/gemini-enterprise?project=${HUB_PROJECT_ID})."
   fi
 else
-  ok "Found ${EXISTING_LICENSES} Gemini Enterprise license config(s) on ${HUB_PROJECT_ID}."
+  skip "Gemini Enterprise license config (${EXISTING_LICENSES} found) already present on '${HUB_PROJECT_ID}'."
 fi
 
 # Ensure initial DataStore exists so CreateEngineRequest succeeds on blank projects
@@ -451,6 +757,9 @@ if [[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(get_
     [[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(get_token)" -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" "${DS_URL}")" == "200" ]] && break
     sleep 4
   done
+  ok "Created Discovery Engine DataStore 'ge-init-store'."
+else
+  skip "Discovery Engine DataStore 'ge-init-store' already exists."
 fi
 
 ENG_URL="https://${GE_LOCATION}-discoveryengine.googleapis.com/v1alpha/projects/${HUB_PROJECT_NUMBER}/locations/${GE_LOCATION}/collections/default_collection/engines/${GE_APP_ID}"
@@ -486,7 +795,7 @@ if [[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(get_
   done
   ok "Gemini Enterprise app '${GE_APP_ID}' ready."
 else
-  ok "Gemini Enterprise app '${GE_APP_ID}' already exists."
+  skip "Gemini Enterprise app '${GE_APP_ID}' already exists."
 fi
 
 # ------------------------------------------------------------------------------
@@ -501,83 +810,101 @@ if [[ ! -f certs/ca.crt || ! -f certs/ca.key ]]; then
     -subj "/O=Enterprise Internal PKI/CN=MCP Internal Root CA" \
     -addext "basicConstraints=critical,CA:TRUE" \
     -addext "keyUsage=critical,keyCertSign,cRLSign"
+  ok "Generated Enterprise Private Root CA (certs/ca.crt)."
+else
+  skip "Enterprise Private Root CA (certs/ca.crt) already exists."
 fi
 
-if ! gcloud certificate-manager trust-configs describe tc-mcp-corp-internal --location="${REGION}" --project="${HUB_PROJECT_ID}" >/dev/null 2>&1; then
+if gcloud certificate-manager trust-configs describe tc-mcp-corp-internal --location="${REGION}" --project="${HUB_PROJECT_ID}" >/dev/null 2>&1; then
+  skip "Certificate Manager TrustConfig 'tc-mcp-corp-internal' already exists."
+else
+  info "Creating Certificate Manager TrustConfig 'tc-mcp-corp-internal'..."
   gcloud certificate-manager trust-configs create tc-mcp-corp-internal \
     --location="${REGION}" \
     --trust-store="trust-anchors=certs/ca.crt" \
     --project="${HUB_PROJECT_ID}"
 fi
 
-if ! gcloud compute networks describe vpc-mcp-internal --project="${HUB_PROJECT_ID}" >/dev/null 2>&1; then
+if gcloud compute networks describe vpc-mcp-internal --project="${HUB_PROJECT_ID}" >/dev/null 2>&1; then
+  skip "Hub VPC 'vpc-mcp-internal' already exists."
+else
+  info "Creating Hub VPC 'vpc-mcp-internal'..."
   gcloud compute networks create vpc-mcp-internal --subnet-mode=custom --project="${HUB_PROJECT_ID}"
 fi
 
-if ! gcloud compute networks subnets describe subnet-ilb-backend --region="${REGION}" --project="${HUB_PROJECT_ID}" >/dev/null 2>&1; then
+if gcloud compute networks subnets describe subnet-ilb-backend --region="${REGION}" --project="${HUB_PROJECT_ID}" >/dev/null 2>&1; then
+  skip "Subnet 'subnet-ilb-backend' already exists."
+else
   gcloud compute networks subnets create subnet-ilb-backend \
     --network=vpc-mcp-internal --region="${REGION}" --range=10.10.1.0/24 \
     --enable-private-ip-google-access --project="${HUB_PROJECT_ID}"
 fi
 
-if ! gcloud compute networks subnets describe subnet-ilb-proxy --region="${REGION}" --project="${HUB_PROJECT_ID}" >/dev/null 2>&1; then
+if gcloud compute networks subnets describe subnet-ilb-proxy --region="${REGION}" --project="${HUB_PROJECT_ID}" >/dev/null 2>&1; then
+  skip "Proxy-only subnet 'subnet-ilb-proxy' already exists."
+else
   gcloud compute networks subnets create subnet-ilb-proxy \
     --network=vpc-mcp-internal --region="${REGION}" --range=10.10.2.0/24 \
     --purpose=REGIONAL_MANAGED_PROXY --role=ACTIVE --project="${HUB_PROJECT_ID}"
 fi
 
-if ! gcloud compute networks subnets describe subnet-agw-psc --region="${REGION}" --project="${HUB_PROJECT_ID}" >/dev/null 2>&1; then
+if gcloud compute networks subnets describe subnet-agw-psc --region="${REGION}" --project="${HUB_PROJECT_ID}" >/dev/null 2>&1; then
+  skip "Agent Gateway PSC subnet 'subnet-agw-psc' already exists."
+else
   gcloud compute networks subnets create subnet-agw-psc \
     --network=vpc-mcp-internal --region="${REGION}" --range=10.10.3.0/28 \
     --enable-private-ip-google-access --project="${HUB_PROJECT_ID}"
 fi
 
-if ! gcloud compute network-attachments describe na-agw-mcp-internal --region="${REGION}" --project="${HUB_PROJECT_ID}" >/dev/null 2>&1; then
+if gcloud compute network-attachments describe na-agw-mcp-internal --region="${REGION}" --project="${HUB_PROJECT_ID}" >/dev/null 2>&1; then
+  skip "PSC Network Attachment 'na-agw-mcp-internal' already exists."
+else
   gcloud compute network-attachments create na-agw-mcp-internal \
     --region="${REGION}" --subnets=subnet-agw-psc \
     --connection-preference=ACCEPT_AUTOMATIC --project="${HUB_PROJECT_ID}"
 fi
 
-if ! gcloud dns managed-zones describe zone-corp-internal --project="${HUB_PROJECT_ID}" >/dev/null 2>&1; then
+if gcloud dns managed-zones describe zone-corp-internal --project="${HUB_PROJECT_ID}" >/dev/null 2>&1; then
+  skip "Cloud DNS private zone 'zone-corp-internal' already exists."
+else
   gcloud dns managed-zones create zone-corp-internal \
     --dns-name="corp.internal." --description="Private DNS zone for internal MCP services" \
     --visibility=private --networks=vpc-mcp-internal --project="${HUB_PROJECT_ID}"
 fi
 
 AGW_SA="service-${HUB_PROJECT_NUMBER}@gcp-sa-agentgateway.iam.gserviceaccount.com"
-if ! gcloud projects add-iam-policy-binding "${HUB_PROJECT_ID}" \
-  --member="serviceAccount:${AGW_SA}" \
-  --role="roles/agentgateway.serviceAgent" --condition=None --quiet >/dev/null 2>&1; then
-  info "Initializing Agent Gateway service agent (${AGW_SA}) on blank project..."
-  BOOT_OP="$(curl -s -X POST \
-    "https://networkservices.googleapis.com/v1/projects/${HUB_PROJECT_ID}/locations/${REGION}/agentGateways?agentGatewayId=agw-sa-init" \
-    -H "Authorization: Bearer $(get_token)" \
-    -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" \
-    -H "Content-Type: application/json" \
-    -d '{"protocols":["MCP"],"googleManaged":{"governedAccessPath":"AGENT_TO_ANYWHERE"}}' | jq -r '.name // empty')"
-  if [[ -n "${BOOT_OP}" ]]; then
-    for _ in {1..30}; do
-      [[ "$(curl -s -H "Authorization: Bearer $(get_token)" -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" "https://networkservices.googleapis.com/v1/${BOOT_OP}" | jq -r '.done // false')" == "true" ]] && break
-      sleep 5
-    done
-    DEL_BOOT="$(curl -s -X DELETE \
-      "https://networkservices.googleapis.com/v1/projects/${HUB_PROJECT_ID}/locations/${REGION}/agentGateways/agw-sa-init" \
+if ! project_has_member_any_role "${HUB_PROJECT_ID}" "serviceAccount:${AGW_SA}"; then
+  if ! gcloud projects add-iam-policy-binding "${HUB_PROJECT_ID}" \
+    --member="serviceAccount:${AGW_SA}" \
+    --role="roles/agentgateway.serviceAgent" --condition=None --quiet >/dev/null 2>&1; then
+    info "Initializing Agent Gateway service agent (${AGW_SA}) on blank project..."
+    BOOT_OP="$(curl -s -X POST \
+      "https://networkservices.googleapis.com/v1/projects/${HUB_PROJECT_ID}/locations/${REGION}/agentGateways?agentGatewayId=agw-sa-init" \
       -H "Authorization: Bearer $(get_token)" \
-      -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" | jq -r '.name // empty')"
-    [[ -n "${DEL_BOOT}" ]] && sleep 5
+      -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" \
+      -H "Content-Type: application/json" \
+      -d '{"protocols":["MCP"],"googleManaged":{"governedAccessPath":"AGENT_TO_ANYWHERE"}}' | jq -r '.name // empty' 2>/dev/null || true)"
+    if [[ -n "${BOOT_OP}" ]]; then
+      for _ in {1..30}; do
+        [[ "$(curl -s -H "Authorization: Bearer $(get_token)" -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" "https://networkservices.googleapis.com/v1/${BOOT_OP}" | jq -r '.done // false' 2>/dev/null)" == "true" ]] && break
+        sleep 5
+      done
+      DEL_BOOT="$(curl -s -X DELETE \
+        "https://networkservices.googleapis.com/v1/projects/${HUB_PROJECT_ID}/locations/${REGION}/agentGateways/agw-sa-init" \
+        -H "Authorization: Bearer $(get_token)" \
+        -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" | jq -r '.name // empty' 2>/dev/null || true)"
+      [[ -n "${DEL_BOOT}" ]] && sleep 5
+    fi
   fi
+  rm -f "cfg/.iam_${HUB_PROJECT_ID}.json"
 fi
 
-for ROLE in \
+ensure_project_iam_roles "${HUB_PROJECT_ID}" "serviceAccount:${AGW_SA}" \
   roles/agentgateway.serviceAgent \
   roles/compute.networkViewer \
   roles/compute.networkAdmin \
   roles/dns.reader \
-  roles/certificatemanager.viewer; do
-  gcloud projects add-iam-policy-binding "${HUB_PROJECT_ID}" \
-    --member="serviceAccount:${AGW_SA}" \
-    --role="${ROLE}" --condition=None --quiet >/dev/null
-done
+  roles/certificatemanager.viewer
 
 PSC_NA_URI="projects/${HUB_PROJECT_NUMBER}/regions/${REGION}/networkAttachments/na-agw-mcp-internal"
 TRUST_CONFIG_URI="projects/${HUB_PROJECT_NUMBER}/locations/${REGION}/trustConfigs/tc-mcp-corp-internal"
@@ -586,11 +913,13 @@ AGW_NAME="agw-vpc-${REGION}-ata"
 AGW_URI="projects/${HUB_PROJECT_ID}/locations/${REGION}/agentGateways/${AGW_NAME}"
 
 ACT_GET="https://networkservices.googleapis.com/v1/projects/${HUB_PROJECT_ID}/locations/${REGION}/agentConnectivityTemplates/act-vpc-mcp-internal"
-if [[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(get_token)" -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" "${ACT_GET}")" != "200" ]]; then
+if [[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(get_token)" -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" "${ACT_GET}")" == "200" ]]; then
+  skip "AgentConnectivityTemplate 'act-vpc-mcp-internal' already exists."
+else
   info "Waiting 60s for Agent Gateway Service Agent IAM propagation..."
   sleep 60
   info "Creating AgentConnectivityTemplate 'act-vpc-mcp-internal'..."
-  ACT_OP="$(curl -s -X POST \
+  ACT_RESP="$(curl -s -X POST \
     "https://networkservices.googleapis.com/v1/projects/${HUB_PROJECT_ID}/locations/${REGION}/agentConnectivityTemplates?agentConnectivityTemplateId=act-vpc-mcp-internal" \
     -H "Authorization: Bearer $(get_token)" \
     -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" \
@@ -610,16 +939,17 @@ if [[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(get_
           \"additionalRoots\": \"PUBLICLY_TRUSTED_ROOTS\"
         }
       }
-    }" | jq -r '.name')"
-  while [[ "$(curl -s -H "Authorization: Bearer $(get_token)" -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" "https://networkservices.googleapis.com/v1/${ACT_OP}" | jq -r '.done // false')" != "true" ]]; do
-    sleep 5
-  done
+    }")"
+  wait_gcp_op "https://networkservices.googleapis.com/v1" "${ACT_RESP}" "AgentConnectivityTemplate 'act-vpc-mcp-internal'" 5
+  ok "Created AgentConnectivityTemplate 'act-vpc-mcp-internal'."
 fi
 
 AGW_GET="https://networkservices.googleapis.com/v1/projects/${HUB_PROJECT_ID}/locations/${REGION}/agentGateways/${AGW_NAME}"
-if [[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(get_token)" -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" "${AGW_GET}")" != "200" ]]; then
+if [[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(get_token)" -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" "${AGW_GET}")" == "200" ]]; then
+  skip "Hub AgentGateway '${AGW_NAME}' already exists."
+else
   info "Creating Hub AgentGateway '${AGW_NAME}'..."
-  AGW_OP="$(curl -s -X POST \
+  AGW_RESP="$(curl -s -X POST \
     "https://networkservices.googleapis.com/v1/projects/${HUB_PROJECT_ID}/locations/${REGION}/agentGateways?agentGatewayId=${AGW_NAME}" \
     -H "Authorization: Bearer $(get_token)" \
     -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" \
@@ -629,13 +959,14 @@ if [[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(get_
       \"googleManaged\": {\"governedAccessPath\": \"AGENT_TO_ANYWHERE\"},
       \"agentConnectivityTemplate\": \"${ACT_URI}\",
       \"registries\": [\"//agentregistry.googleapis.com/projects/${HUB_PROJECT_ID}/locations/${REGION}\"]
-    }" | jq -r '.name')"
-  while [[ "$(curl -s -H "Authorization: Bearer $(get_token)" -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" "https://networkservices.googleapis.com/v1/${AGW_OP}" | jq -r '.done // false')" != "true" ]]; do
-    sleep 10
-  done
+    }")"
+  wait_gcp_op "https://networkservices.googleapis.com/v1" "${AGW_RESP}" "AgentGateway '${AGW_NAME}'" 10
+  ok "Created Hub AgentGateway '${AGW_NAME}'."
 fi
 
-if ! gcloud service-extensions authz-extensions describe agw-authz-ext-iap-v2 --location="${REGION}" --project="${HUB_PROJECT_ID}" >/dev/null 2>&1; then
+if gcloud service-extensions authz-extensions describe agw-authz-ext-iap-v2 --location="${REGION}" --project="${HUB_PROJECT_ID}" >/dev/null 2>&1; then
+  skip "Service Extension AuthzExtension 'agw-authz-ext-iap-v2' already exists."
+else
   cat > cfg/iap-authz-ext.yaml <<EOF
 name: agw-authz-ext-iap-v2
 service: iap.googleapis.com
@@ -649,8 +980,10 @@ EOF
 fi
 
 AUTHZ_GET="https://networksecurity.googleapis.com/v1alpha1/projects/${HUB_PROJECT_ID}/locations/${REGION}/authzPolicies/${AGW_NAME}-authz-policy-iap"
-if [[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(get_token)" -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" "${AUTHZ_GET}")" != "200" ]]; then
-  AUTHZ_OP="$(curl -s -X POST \
+if [[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(get_token)" -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" "${AUTHZ_GET}")" == "200" ]]; then
+  skip "AuthzPolicy '${AGW_NAME}-authz-policy-iap' already exists."
+else
+  AUTHZ_RESP="$(curl -s -X POST \
     "https://networksecurity.googleapis.com/v1alpha1/projects/${HUB_PROJECT_ID}/locations/${REGION}/authzPolicies?authz_policy_id=${AGW_NAME}-authz-policy-iap" \
     -H "Authorization: Bearer $(get_token)" \
     -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" \
@@ -665,16 +998,17 @@ if [[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(get_
           \"resources\": [\"projects/${HUB_PROJECT_ID}/locations/${REGION}/authzExtensions/agw-authz-ext-iap-v2\"]
         }
       }
-    }" | jq -r '.name')"
-  while [[ "$(curl -s -H "Authorization: Bearer $(get_token)" -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" "https://networksecurity.googleapis.com/v1alpha1/${AUTHZ_OP}" | jq -r '.done // false')" != "true" ]]; do
-    sleep 5
-  done
+    }")"
+  wait_gcp_op "https://networksecurity.googleapis.com/v1alpha1" "${AUTHZ_RESP}" "AuthzPolicy '${AGW_NAME}-authz-policy-iap'" 5
+  ok "Created AuthzPolicy '${AGW_NAME}-authz-policy-iap'."
 fi
 
 UAP_GET="https://iam.googleapis.com/v3/projects/${HUB_PROJECT_ID}/locations/global/accessPolicies/agent-gateway-allow-policy"
-if [[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(get_token)" -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" "${UAP_GET}")" != "200" ]]; then
+if [[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(get_token)" -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" "${UAP_GET}")" == "200" ]]; then
+  skip "IAM v3 AccessPolicy 'agent-gateway-allow-policy' already exists."
+else
   info "Creating IAM v3 Universal Access Policy 'agent-gateway-allow-policy'..."
-  UAP_OP="$(curl -s -X POST \
+  UAP_RESP="$(curl -s -X POST \
     "https://iam.googleapis.com/v3/projects/${HUB_PROJECT_ID}/locations/global/accessPolicies?accessPolicyId=agent-gateway-allow-policy" \
     -H "Authorization: Bearer $(get_token)" \
     -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" \
@@ -695,18 +1029,17 @@ if [[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(get_
           }
         ]
       }
-    }" | jq -r '.name // empty')"
-  if [[ -n "${UAP_OP}" ]]; then
-    while [[ "$(curl -s -H "Authorization: Bearer $(get_token)" -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" "https://iam.googleapis.com/v3/${UAP_OP}" | jq -r '.done // false')" != "true" ]]; do
-      sleep 3
-    done
-  fi
+    }")"
+  wait_gcp_op "https://iam.googleapis.com/v3" "${UAP_RESP}" "IAM v3 AccessPolicy 'agent-gateway-allow-policy'" 3
+  ok "Created IAM v3 AccessPolicy 'agent-gateway-allow-policy'."
 fi
 
 BIND_GET="https://iam.googleapis.com/v3/projects/${HUB_PROJECT_ID}/locations/global/policyBindings/agent-gateway-allow-binding"
-if [[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(get_token)" -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" "${BIND_GET}")" != "200" ]]; then
+if [[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(get_token)" -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" "${BIND_GET}")" == "200" ]]; then
+  skip "IAM v3 PolicyBinding 'agent-gateway-allow-binding' already exists."
+else
   info "Binding IAM v3 Universal Access Policy to project '${HUB_PROJECT_ID}'..."
-  BIND_OP="$(curl -s -X POST \
+  BIND_RESP="$(curl -s -X POST \
     "https://iam.googleapis.com/v3/projects/${HUB_PROJECT_ID}/locations/global/policyBindings?policyBindingId=agent-gateway-allow-binding" \
     -H "Authorization: Bearer $(get_token)" \
     -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" \
@@ -717,170 +1050,222 @@ if [[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(get_
       \"target\": {
         \"resource\": \"//cloudresourcemanager.googleapis.com/projects/${HUB_PROJECT_ID}\"
       }
-    }" | jq -r '.name // empty')"
-  if [[ -n "${BIND_OP}" ]]; then
-    while [[ "$(curl -s -H "Authorization: Bearer $(get_token)" -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" "https://iam.googleapis.com/v3/${BIND_OP}" | jq -r '.done // false')" != "true" ]]; do
-      sleep 3
-    done
-  fi
+    }")"
+  wait_gcp_op "https://iam.googleapis.com/v3" "${BIND_RESP}" "IAM v3 PolicyBinding 'agent-gateway-allow-binding'" 3
+  ok "Created IAM v3 PolicyBinding 'agent-gateway-allow-binding'."
 fi
 
-info "Binding '${GE_APP_ID}' defaultEgressAgentGateway to '${AGW_NAME}'..."
-curl -s -X PATCH \
-  "https://${GE_LOCATION}-discoveryengine.googleapis.com/v1/projects/${HUB_PROJECT_ID}/locations/${GE_LOCATION}/collections/default_collection/engines/${GE_APP_ID}?updateMask=agentGatewaySetting.defaultEgressAgentGateway.name" \
+CUR_ENG_AGW="$(curl -s \
   -H "Authorization: Bearer $(get_token)" \
   -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" \
-  -H "Content-Type: application/json" \
-  -d "{\"agentGatewaySetting\": {\"defaultEgressAgentGateway\": {\"name\": \"${AGW_URI}\"}}}" >/dev/null
-ok "Hub Agent Gateway & IAM v3 UAP bound to '${GE_APP_ID}'."
+  "https://${GE_LOCATION}-discoveryengine.googleapis.com/v1/projects/${HUB_PROJECT_ID}/locations/${GE_LOCATION}/collections/default_collection/engines/${GE_APP_ID}" \
+  | jq -r '.agentGatewaySetting.defaultEgressAgentGateway.name // empty' 2>/dev/null || true)"
+if [[ "${CUR_ENG_AGW}" == *"/agentGateways/${AGW_NAME}" ]]; then
+  skip "Engine '${GE_APP_ID}' defaultEgressAgentGateway already bound to '${AGW_NAME}'."
+else
+  info "Binding '${GE_APP_ID}' defaultEgressAgentGateway to '${AGW_NAME}'..."
+  curl -s -X PATCH \
+    "https://${GE_LOCATION}-discoveryengine.googleapis.com/v1/projects/${HUB_PROJECT_ID}/locations/${GE_LOCATION}/collections/default_collection/engines/${GE_APP_ID}?updateMask=agentGatewaySetting.defaultEgressAgentGateway.name" \
+    -H "Authorization: Bearer $(get_token)" \
+    -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" \
+    -H "Content-Type: application/json" \
+    -d "{\"agentGatewaySetting\": {\"defaultEgressAgentGateway\": {\"name\": \"${AGW_URI}\"}}}" >/dev/null
+  ok "Bound '${GE_APP_ID}' defaultEgressAgentGateway to '${AGW_NAME}'."
+fi
 
 # ------------------------------------------------------------------------------
 # Stage 5: Deploy Internal Cloud Run MCP Server (mcp-countries-poc)
 # ------------------------------------------------------------------------------
 stage "Stage 5: Deploy Internal Cloud Run MCP Server (${APIGEE_PROJECT_ID})"
 
-gcloud run deploy mcp-countries-poc \
-  --source=mcp_countries_server \
-  --region="${REGION}" \
-  --project="${APIGEE_PROJECT_ID}" \
-  --service-account="sa-mcp-countries@${APIGEE_PROJECT_ID}.iam.gserviceaccount.com" \
-  --ingress=internal-and-cloud-load-balancing \
-  --no-allow-unauthenticated \
-  --port=8080 \
-  --min-instances=0 \
-  --max-instances=5 \
-  --set-env-vars="GOOGLE_CLOUD_PROJECT=${APIGEE_PROJECT_ID},EXPECTED_OAUTH_CLIENT_ID=${OAUTH_CLIENT_ID}" \
-  --quiet
+EXISTING_CR_URL="$(gcloud run services describe mcp-countries-poc --region="${REGION}" --project="${APIGEE_PROJECT_ID}" --format='value(status.url)' 2>/dev/null || true)"
+if [[ -n "${EXISTING_CR_URL}" && "${REBUILD_MCP}" != "true" ]]; then
+  CLOUD_RUN_URL="${EXISTING_CR_URL}"
+  save_env
+  skip "Cloud Run MCP service 'mcp-countries-poc' already deployed (${CLOUD_RUN_URL}). Pass --rebuild-mcp to rebuild."
+else
+  info "Deploying Cloud Run MCP service 'mcp-countries-poc' from source..."
+  gcloud run deploy mcp-countries-poc \
+    --source=mcp_countries_server \
+    --region="${REGION}" \
+    --project="${APIGEE_PROJECT_ID}" \
+    --service-account="sa-mcp-countries@${APIGEE_PROJECT_ID}.iam.gserviceaccount.com" \
+    --ingress=internal-and-cloud-load-balancing \
+    --no-allow-unauthenticated \
+    --port=8080 \
+    --min-instances=0 \
+    --max-instances=5 \
+    --set-env-vars="GOOGLE_CLOUD_PROJECT=${APIGEE_PROJECT_ID},EXPECTED_OAUTH_CLIENT_ID=${OAUTH_CLIENT_ID}" \
+    --quiet
+  CLOUD_RUN_URL="$(gcloud run services describe mcp-countries-poc --region="${REGION}" --project="${APIGEE_PROJECT_ID}" --format='value(status.url)')"
+  save_env
+  ok "Cloud Run MCP server deployed: ${CLOUD_RUN_URL}"
+fi
 
-gcloud run services add-iam-policy-binding mcp-countries-poc \
-  --region="${REGION}" \
-  --project="${APIGEE_PROJECT_ID}" \
-  --member="serviceAccount:sa-apigee-invoker@${APIGEE_PROJECT_ID}.iam.gserviceaccount.com" \
-  --role="roles/run.invoker" >/dev/null
-
-CLOUD_RUN_URL="$(gcloud run services describe mcp-countries-poc --region="${REGION}" --project="${APIGEE_PROJECT_ID}" --format='value(status.url)')"
-save_env
-ok "Cloud Run MCP server deployed: ${CLOUD_RUN_URL}"
+ensure_run_invoker "${APIGEE_PROJECT_ID}" "${REGION}" "mcp-countries-poc" \
+  "serviceAccount:sa-apigee-invoker@${APIGEE_PROJECT_ID}.iam.gserviceaccount.com"
 
 # ------------------------------------------------------------------------------
 # Stage 6: Provision Apigee X (EVALUATION, disableVpcPeering=true), KMS & Truststore
 # ------------------------------------------------------------------------------
 stage "Stage 6: Apigee X EVALUATION Org, KMS, Runtime Instance & Truststore"
 
-if ! gcloud kms keyrings describe "apigee-keyring-${REGION}" --location="${REGION}" --project="${APIGEE_PROJECT_ID}" >/dev/null 2>&1; then
+if gcloud kms keyrings describe "apigee-keyring-${REGION}" --location="${REGION}" --project="${APIGEE_PROJECT_ID}" >/dev/null 2>&1; then
+  skip "Cloud KMS KeyRing 'apigee-keyring-${REGION}' already exists."
+else
   gcloud kms keyrings create "apigee-keyring-${REGION}" --location="${REGION}" --project="${APIGEE_PROJECT_ID}"
 fi
-if ! gcloud kms keys describe apigee-disk-key --keyring="apigee-keyring-${REGION}" --location="${REGION}" --project="${APIGEE_PROJECT_ID}" >/dev/null 2>&1; then
+
+if gcloud kms keys describe apigee-disk-key --keyring="apigee-keyring-${REGION}" --location="${REGION}" --project="${APIGEE_PROJECT_ID}" >/dev/null 2>&1; then
+  skip "Cloud KMS CryptoKey 'apigee-disk-key' already exists."
+else
   gcloud kms keys create apigee-disk-key --keyring="apigee-keyring-${REGION}" --location="${REGION}" --purpose=encryption --project="${APIGEE_PROJECT_ID}"
 fi
-KMS_KEY_ID="projects/${APIGEE_PROJECT_ID}/locations/${REGION}/keyRings/apigee-keyring-${REGION}/cryptoKeys/apigee-disk-key"
-gcloud kms keys add-iam-policy-binding apigee-disk-key \
-  --keyring="apigee-keyring-${REGION}" --location="${REGION}" \
-  --member="serviceAccount:${APIGEE_SERVICE_AGENT}" \
-  --role="roles/cloudkms.cryptoKeyEncrypterDecrypter" \
-  --project="${APIGEE_PROJECT_ID}" >/dev/null
 
-if [[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(get_token)" "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}")" != "200" ]]; then
+KMS_KEY_ID="projects/${APIGEE_PROJECT_ID}/locations/${REGION}/keyRings/apigee-keyring-${REGION}/cryptoKeys/apigee-disk-key"
+ensure_kms_iam_role "${APIGEE_PROJECT_ID}" "${REGION}" "apigee-keyring-${REGION}" "apigee-disk-key" \
+  "serviceAccount:${APIGEE_SERVICE_AGENT}" "roles/cloudkms.cryptoKeyEncrypterDecrypter"
+
+ORG_STATE=""
+for _ in 1 2 3; do
+  ORG_BODY="$(curl -s -H "Authorization: Bearer $(get_token)" "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}")"
+  ORG_STATE="$(echo "${ORG_BODY}" | jq -r '.state // empty' 2>/dev/null || true)"
+  ORG_ERR_CODE="$(echo "${ORG_BODY}" | jq -r '.error.code // empty' 2>/dev/null || true)"
+  [[ -n "${ORG_STATE}" || "${ORG_ERR_CODE}" == "404" || "${ORG_ERR_CODE}" == "403" ]] && break
+  sleep 3
+done
+
+if [[ "${ORG_STATE}" == "ACTIVE" ]]; then
+  skip "Apigee X organization '${APIGEE_PROJECT_ID}' already exists (ACTIVE)."
+elif [[ -n "${ORG_STATE}" ]]; then
+  info "Apigee X organization '${APIGEE_PROJECT_ID}' is currently ${ORG_STATE}; waiting until ACTIVE..."
+  while [[ "$(curl -s -H "Authorization: Bearer $(get_token)" "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}" | jq -r '.state // ""' 2>/dev/null)" != "ACTIVE" ]]; do
+    sleep 10
+  done
+  wait_apigee_idle
+  ok "Apigee X organization '${APIGEE_PROJECT_ID}' is now ACTIVE."
+else
   info "Creating Apigee X EVALUATION organization '${APIGEE_PROJECT_ID}' (disableVpcPeering=true)..."
-  OP_ORG="$(curl -s -X POST \
+  apigee_post_and_wait \
     "https://apigee.googleapis.com/v1/organizations?parent=projects/${APIGEE_PROJECT_ID}" \
-    -H "Authorization: Bearer $(get_token)" \
-    -H "Content-Type: application/json" \
-    -d "{
+    "{
       \"name\": \"${APIGEE_PROJECT_ID}\",
       \"displayName\": \"Apigee X Internal MCP Organization\",
       \"analyticsRegion\": \"${REGION}\",
       \"runtimeType\": \"CLOUD\",
       \"billingType\": \"EVALUATION\",
       \"disableVpcPeering\": true
-    }" | jq -r '.name')"
-  while [[ "$(curl -s -H "Authorization: Bearer $(get_token)" "https://apigee.googleapis.com/v1/${OP_ORG}" | jq -r '.done // false')" != "true" ]]; do
-    sleep 10
-  done
+    }" \
+    "Apigee organization '${APIGEE_PROJECT_ID}'" 10
+  ok "Created Apigee X organization '${APIGEE_PROJECT_ID}'."
 fi
 
-if [[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(get_token)" "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}/environments/eval-mcp")" != "200" ]]; then
-  curl -s -X POST \
+if [[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(get_token)" "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}/environments/eval-mcp")" == "200" ]]; then
+  skip "Apigee environment 'eval-mcp' already exists."
+else
+  info "Creating Apigee environment 'eval-mcp'..."
+  apigee_post_and_wait \
     "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}/environments" \
-    -H "Authorization: Bearer $(get_token)" -H "Content-Type: application/json" \
-    -d '{"name": "eval-mcp", "displayName": "Internal MCP Evaluation Env", "deploymentProxyType": "PROGRAMMABLE", "apiProxyType": "PROGRAMMABLE"}' >/dev/null
-  sleep 5
+    '{"name": "eval-mcp", "displayName": "Internal MCP Evaluation Env", "deploymentProxyType": "PROGRAMMABLE", "apiProxyType": "PROGRAMMABLE"}' \
+    "Apigee environment 'eval-mcp'" 5
+  ok "Created Apigee environment 'eval-mcp'."
 fi
 
-if [[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(get_token)" "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}/envgroups/internal-mcp-group")" != "200" ]]; then
-  curl -s -X POST \
+if [[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(get_token)" "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}/envgroups/internal-mcp-group")" == "200" ]]; then
+  skip "Apigee environment group 'internal-mcp-group' already exists."
+else
+  info "Creating Apigee environment group 'internal-mcp-group' (${COUNTRIES_HOST})..."
+  apigee_post_and_wait \
     "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}/envgroups" \
-    -H "Authorization: Bearer $(get_token)" -H "Content-Type: application/json" \
-    -d "{\"name\": \"internal-mcp-group\", \"hostnames\": [\"${COUNTRIES_HOST}\"]}" >/dev/null
-  sleep 5
-  OP_EG="$(curl -s -X POST \
+    "{\"name\": \"internal-mcp-group\", \"hostnames\": [\"${COUNTRIES_HOST}\"]}" \
+    "Apigee envgroup 'internal-mcp-group'" 5
+  ok "Created Apigee environment group 'internal-mcp-group'."
+fi
+
+EG_ATTACHED="$(curl -s -H "Authorization: Bearer $(get_token)" \
+  "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}/envgroups/internal-mcp-group/attachments" \
+  | jq -r '[.environmentGroupAttachments[]? | select(.environment == "eval-mcp")] | length' 2>/dev/null || echo "0")"
+if [[ "${EG_ATTACHED}" != "0" ]]; then
+  skip "Environment 'eval-mcp' already attached to 'internal-mcp-group'."
+else
+  info "Attaching environment 'eval-mcp' to 'internal-mcp-group'..."
+  apigee_post_and_wait \
     "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}/envgroups/internal-mcp-group/attachments" \
-    -H "Authorization: Bearer $(get_token)" -H "Content-Type: application/json" \
-    -d '{"environment": "eval-mcp"}' | jq -r '.name')"
-  while [[ "$(curl -s -H "Authorization: Bearer $(get_token)" "https://apigee.googleapis.com/v1/${OP_EG}" | jq -r '.done // false')" != "true" ]]; do
-    sleep 5
-  done
+    '{"environment": "eval-mcp"}' \
+    "EnvGroup attachment 'eval-mcp'" 5
+  ok "Attached environment 'eval-mcp' to 'internal-mcp-group'."
 fi
 
 INST_URL="https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}/instances/apigee-${REGION}"
-INST_STATE="$(curl -s -H "Authorization: Bearer $(get_token)" "${INST_URL}" | jq -r '.state // "MISSING"')"
-if [[ "${INST_STATE}" == "MISSING" ]]; then
-  info "Provisioning Apigee X Runtime Instance 'apigee-${REGION}' (~20-25 minutes; single-tenant runtime)..."
-  OP_INST="$(curl -s -X POST \
-    "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}/instances" \
-    -H "Authorization: Bearer $(get_token)" \
-    -H "Content-Type: application/json" \
-    -d "{
-      \"name\": \"apigee-${REGION}\",
-      \"location\": \"${REGION}\",
-      \"diskEncryptionKeyName\": \"${KMS_KEY_ID}\",
-      \"consumerAcceptList\": [\"${HUB_PROJECT_ID}\", \"${APIGEE_PROJECT_ID}\"]
-    }" | jq -r '.name')"
-  ELAPSED=0
-  while [[ "$(curl -s -H "Authorization: Bearer $(get_token)" "https://apigee.googleapis.com/v1/${OP_INST}" | jq -r '.done // false')" != "true" ]]; do
-    if [[ -t 1 ]]; then
-      printf "\r  ... Apigee runtime provisioning in progress (%dm %02ds elapsed)" $((ELAPSED/60)) $((ELAPSED%60))
-    elif (( ELAPSED % 60 == 0 )); then
-      echo "  ... Apigee runtime provisioning in progress ($((ELAPSED/60))m elapsed)"
-    fi
-    sleep 30
-    ELAPSED=$((ELAPSED+30))
-  done
-  [[ -t 1 ]] && echo ""
+INST_STATE="$(curl -s -H "Authorization: Bearer $(get_token)" "${INST_URL}" | jq -r '.state // "MISSING"' 2>/dev/null || echo "MISSING")"
+if [[ "${INST_STATE}" == "ACTIVE" ]]; then
+  skip "Apigee X runtime instance 'apigee-${REGION}' already exists (ACTIVE)."
 elif [[ "${INST_STATE}" == "CREATING" ]]; then
-  info "Apigee instance 'apigee-${REGION}' is currently CREATING; waiting until ACTIVE..."
+  info "Apigee X runtime instance 'apigee-${REGION}' is already CREATING; resuming wait until ACTIVE..."
   ELAPSED=0
-  while [[ "$(curl -s -H "Authorization: Bearer $(get_token)" "${INST_URL}" | jq -r '.state // ""')" != "ACTIVE" ]]; do
-    if [[ ! -t 1 ]] && (( ELAPSED % 60 == 0 )); then
+  while [[ "$(curl -s -H "Authorization: Bearer $(get_token)" "${INST_URL}" | jq -r '.state // ""' 2>/dev/null)" != "ACTIVE" ]]; do
+    if [[ -t 1 ]]; then
+      printf "\r  ... Waiting for CREATING Apigee runtime (%dm %02ds elapsed)" $((ELAPSED/60)) $((ELAPSED%60))
+    elif (( ELAPSED % 60 == 0 )); then
       echo "  ... Waiting for CREATING Apigee runtime ($((ELAPSED/60))m elapsed)"
     fi
     sleep 30
     ELAPSED=$((ELAPSED+30))
   done
+  [[ -t 1 ]] && echo ""
+  ok "Apigee X runtime instance 'apigee-${REGION}' is now ACTIVE."
+else
+  info "Provisioning Apigee X Runtime Instance 'apigee-${REGION}' (~20-25 minutes; single-tenant runtime)..."
+  apigee_post_and_wait \
+    "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}/instances" \
+    "{
+      \"name\": \"apigee-${REGION}\",
+      \"location\": \"${REGION}\",
+      \"diskEncryptionKeyName\": \"${KMS_KEY_ID}\",
+      \"consumerAcceptList\": [\"${HUB_PROJECT_ID}\", \"${APIGEE_PROJECT_ID}\"]
+    }" \
+    "Apigee runtime instance 'apigee-${REGION}'" 30
+  ok "Apigee X runtime instance 'apigee-${REGION}' is now ACTIVE."
 fi
 
-ATTACHED="$(curl -s -H "Authorization: Bearer $(get_token)" "${INST_URL}/attachments" | jq -r '[.attachments[]? | select(.environment == "eval-mcp")] | length')"
-if [[ "${ATTACHED}" == "0" ]]; then
-  OP_ATT="$(curl -s -X POST "${INST_URL}/attachments" \
-    -H "Authorization: Bearer $(get_token)" -H "Content-Type: application/json" \
-    -d '{"environment": "eval-mcp"}' | jq -r '.name')"
-  while [[ "$(curl -s -H "Authorization: Bearer $(get_token)" "https://apigee.googleapis.com/v1/${OP_ATT}" | jq -r '.done // false')" != "true" ]]; do
-    sleep 10
-  done
+ATTACHED="$(curl -s -H "Authorization: Bearer $(get_token)" "${INST_URL}/attachments" | jq -r '[.attachments[]? | select(.environment == "eval-mcp")] | length' 2>/dev/null || echo "0")"
+if [[ "${ATTACHED}" != "0" ]]; then
+  skip "Environment 'eval-mcp' already attached to runtime instance 'apigee-${REGION}'."
+else
+  info "Attaching environment 'eval-mcp' to runtime instance 'apigee-${REGION}'..."
+  apigee_post_and_wait "${INST_URL}/attachments" '{"environment": "eval-mcp"}' "Instance attachment 'eval-mcp'" 10
+  ok "Attached environment 'eval-mcp' to runtime instance 'apigee-${REGION}'."
 fi
 
-APIGEE_NB_SERVICE_ATTACHMENT="$(curl -s -H "Authorization: Bearer $(get_token)" "${INST_URL}" | jq -r '.serviceAttachment')"
+APIGEE_NB_SERVICE_ATTACHMENT="$(curl -s -H "Authorization: Bearer $(get_token)" "${INST_URL}" | jq -r '.serviceAttachment // empty' 2>/dev/null || true)"
+if [[ -z "${APIGEE_NB_SERVICE_ATTACHMENT}" ]]; then
+  err "Could not read .serviceAttachment from ${INST_URL}"
+  exit 1
+fi
 save_env
 ok "Apigee Northbound PSC Service Attachment: ${APIGEE_NB_SERVICE_ATTACHMENT}"
 
-if [[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(get_token)" "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}/environments/eval-mcp/keystores/mcp-ca-truststore")" != "200" ]]; then
+if [[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(get_token)" "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}/environments/eval-mcp/keystores/mcp-ca-truststore")" == "200" ]]; then
+  skip "Apigee truststore 'mcp-ca-truststore' already exists."
+else
+  info "Creating Apigee truststore 'mcp-ca-truststore'..."
   curl -s -X POST "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}/environments/eval-mcp/keystores" \
     -H "Authorization: Bearer $(get_token)" -H "Content-Type: application/json" \
     -d '{"name": "mcp-ca-truststore"}' >/dev/null
+fi
+
+if [[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(get_token)" "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}/environments/eval-mcp/keystores/mcp-ca-truststore/aliases/mcp-root-ca")" == "200" ]]; then
+  skip "Apigee truststore alias 'mcp-root-ca' already uploaded."
+else
+  info "Uploading Root CA alias 'mcp-root-ca' to 'mcp-ca-truststore'..."
   curl -s -X POST "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}/environments/eval-mcp/keystores/mcp-ca-truststore/aliases?alias=mcp-root-ca&format=keycertfile" \
     -H "Authorization: Bearer $(get_token)" -F "file=@certs/ca.crt" >/dev/null
 fi
-if [[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(get_token)" "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}/environments/eval-mcp/references/mcp-ca-truststore-ref")" != "200" ]]; then
+
+if [[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(get_token)" "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}/environments/eval-mcp/references/mcp-ca-truststore-ref")" == "200" ]]; then
+  skip "Apigee truststore reference 'mcp-ca-truststore-ref' already exists."
+else
+  info "Creating Apigee truststore reference 'mcp-ca-truststore-ref'..."
   curl -s -X POST "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}/environments/eval-mcp/references" \
     -H "Authorization: Bearer $(get_token)" -H "Content-Type: application/json" \
     -d '{"name": "mcp-ca-truststore-ref", "resourceType": "KeyStore", "refers": "mcp-ca-truststore"}' >/dev/null
@@ -891,34 +1276,46 @@ fi
 # ------------------------------------------------------------------------------
 stage "Stage 7: Southbound Producer VPC, PSC & Two-Pass EA_HOST SAN TLS"
 
-if ! gcloud compute networks describe vpc-apigee-mcp --project="${APIGEE_PROJECT_ID}" >/dev/null 2>&1; then
+if gcloud compute networks describe vpc-apigee-mcp --project="${APIGEE_PROJECT_ID}" >/dev/null 2>&1; then
+  skip "Southbound VPC 'vpc-apigee-mcp' already exists."
+else
   gcloud compute networks create vpc-apigee-mcp --subnet-mode=custom --project="${APIGEE_PROJECT_ID}"
 fi
-if ! gcloud compute networks subnets describe subnet-apigee-mcp-backend --region="${REGION}" --project="${APIGEE_PROJECT_ID}" >/dev/null 2>&1; then
+if gcloud compute networks subnets describe subnet-apigee-mcp-backend --region="${REGION}" --project="${APIGEE_PROJECT_ID}" >/dev/null 2>&1; then
+  skip "Subnet 'subnet-apigee-mcp-backend' already exists."
+else
   gcloud compute networks subnets create subnet-apigee-mcp-backend \
     --network=vpc-apigee-mcp --region="${REGION}" --range=10.30.1.0/24 \
     --enable-private-ip-google-access --project="${APIGEE_PROJECT_ID}"
 fi
-if ! gcloud compute networks subnets describe subnet-apigee-mcp-proxy --region="${REGION}" --project="${APIGEE_PROJECT_ID}" >/dev/null 2>&1; then
+if gcloud compute networks subnets describe subnet-apigee-mcp-proxy --region="${REGION}" --project="${APIGEE_PROJECT_ID}" >/dev/null 2>&1; then
+  skip "Proxy-only subnet 'subnet-apigee-mcp-proxy' already exists."
+else
   gcloud compute networks subnets create subnet-apigee-mcp-proxy \
     --network=vpc-apigee-mcp --region="${REGION}" --purpose=REGIONAL_MANAGED_PROXY \
     --role=ACTIVE --range=10.30.2.0/24 --project="${APIGEE_PROJECT_ID}"
 fi
-if ! gcloud compute networks subnets describe subnet-apigee-mcp-psc-nat --region="${REGION}" --project="${APIGEE_PROJECT_ID}" >/dev/null 2>&1; then
+if gcloud compute networks subnets describe subnet-apigee-mcp-psc-nat --region="${REGION}" --project="${APIGEE_PROJECT_ID}" >/dev/null 2>&1; then
+  skip "PSC NAT subnet 'subnet-apigee-mcp-psc-nat' already exists."
+else
   gcloud compute networks subnets create subnet-apigee-mcp-psc-nat \
     --network=vpc-apigee-mcp --region="${REGION}" --purpose=PRIVATE_SERVICE_CONNECT \
     --range=10.30.3.0/24 --project="${APIGEE_PROJECT_ID}"
 fi
-if ! gcloud compute addresses describe ip-ilb-mcp-countries --region="${REGION}" --project="${APIGEE_PROJECT_ID}" >/dev/null 2>&1; then
+if gcloud compute addresses describe ip-ilb-mcp-countries --region="${REGION}" --project="${APIGEE_PROJECT_ID}" >/dev/null 2>&1; then
+  skip "Southbound ILB IP 'ip-ilb-mcp-countries' (${SB_ILB_IP}) already exists."
+else
   gcloud compute addresses create ip-ilb-mcp-countries \
     --region="${REGION}" --subnet=subnet-apigee-mcp-backend \
     --addresses="${SB_ILB_IP}" --project="${APIGEE_PROJECT_ID}"
 fi
 
-if [[ ! -f certs/mcp-countries-sb.key ]]; then
-  openssl genrsa -out certs/mcp-countries-sb.key 2048
-fi
-cat > certs/countries-sb-init.cnf <<EOF
+ensure_sb_csr() {
+  if [[ ! -f certs/mcp-countries-sb.key ]]; then
+    openssl genrsa -out certs/mcp-countries-sb.key 2048
+  fi
+  if [[ ! -f certs/mcp-countries-sb.csr ]]; then
+    cat > certs/countries-sb-init.cnf <<EOF
 [req]
 distinguished_name = dn
 req_extensions = v3_req
@@ -931,21 +1328,30 @@ keyUsage = critical, digitalSignature, keyEncipherment
 extendedKeyUsage = serverAuth
 subjectAltName = DNS:${COUNTRIES_HOST},IP:${SB_ILB_IP},IP:${HUB_APIGEE_ILB_IP}
 EOF
-openssl req -new -key certs/mcp-countries-sb.key -out certs/mcp-countries-sb.csr -config certs/countries-sb-init.cnf
-openssl x509 -req -in certs/mcp-countries-sb.csr -CA certs/ca.crt -CAkey certs/ca.key -CAcreateserial \
-  -out certs/mcp-countries-sb-init.crt -days 825 -sha256 -extensions v3_req -extfile certs/countries-sb-init.cnf
+    openssl req -new -key certs/mcp-countries-sb.key -out certs/mcp-countries-sb.csr -config certs/countries-sb-init.cnf
+  fi
+}
 
-if ! gcloud compute ssl-certificates describe cert-mcp-countries-sb-v1 --region="${REGION}" --project="${APIGEE_PROJECT_ID}" >/dev/null 2>&1; then
+if gcloud compute ssl-certificates describe cert-mcp-countries-sb-v1 --region="${REGION}" --project="${APIGEE_PROJECT_ID}" >/dev/null 2>&1; then
+  skip "Southbound Pass-1 SSL certificate 'cert-mcp-countries-sb-v1' already exists."
+else
+  ensure_sb_csr
+  openssl x509 -req -in certs/mcp-countries-sb.csr -CA certs/ca.crt -CAkey certs/ca.key -CAcreateserial \
+    -out certs/mcp-countries-sb-init.crt -days 825 -sha256 -extensions v3_req -extfile certs/countries-sb-init.cnf
   gcloud compute ssl-certificates create cert-mcp-countries-sb-v1 \
     --certificate=certs/mcp-countries-sb-init.crt --private-key=certs/mcp-countries-sb.key \
     --region="${REGION}" --project="${APIGEE_PROJECT_ID}"
 fi
-if ! gcloud compute network-endpoint-groups describe neg-mcp-countries-poc --region="${REGION}" --project="${APIGEE_PROJECT_ID}" >/dev/null 2>&1; then
+if gcloud compute network-endpoint-groups describe neg-mcp-countries-poc --region="${REGION}" --project="${APIGEE_PROJECT_ID}" >/dev/null 2>&1; then
+  skip "Serverless NEG 'neg-mcp-countries-poc' already exists."
+else
   gcloud compute network-endpoint-groups create neg-mcp-countries-poc \
     --region="${REGION}" --network-endpoint-type=serverless \
     --cloud-run-service=mcp-countries-poc --project="${APIGEE_PROJECT_ID}"
 fi
-if ! gcloud compute backend-services describe bs-mcp-countries-poc --region="${REGION}" --project="${APIGEE_PROJECT_ID}" >/dev/null 2>&1; then
+if gcloud compute backend-services describe bs-mcp-countries-poc --region="${REGION}" --project="${APIGEE_PROJECT_ID}" >/dev/null 2>&1; then
+  skip "Southbound BackendService 'bs-mcp-countries-poc' already exists."
+else
   gcloud compute backend-services create bs-mcp-countries-poc \
     --load-balancing-scheme=INTERNAL_MANAGED --protocol=HTTP \
     --region="${REGION}" --project="${APIGEE_PROJECT_ID}"
@@ -953,23 +1359,31 @@ if ! gcloud compute backend-services describe bs-mcp-countries-poc --region="${R
     --region="${REGION}" --network-endpoint-group=neg-mcp-countries-poc \
     --network-endpoint-group-region="${REGION}" --project="${APIGEE_PROJECT_ID}"
 fi
-if ! gcloud compute url-maps describe um-mcp-countries-poc --region="${REGION}" --project="${APIGEE_PROJECT_ID}" >/dev/null 2>&1; then
+if gcloud compute url-maps describe um-mcp-countries-poc --region="${REGION}" --project="${APIGEE_PROJECT_ID}" >/dev/null 2>&1; then
+  skip "Southbound URL Map 'um-mcp-countries-poc' already exists."
+else
   gcloud compute url-maps create um-mcp-countries-poc \
     --default-service=bs-mcp-countries-poc --region="${REGION}" --project="${APIGEE_PROJECT_ID}"
 fi
-if ! gcloud compute target-https-proxies describe tp-mcp-countries-poc --region="${REGION}" --project="${APIGEE_PROJECT_ID}" >/dev/null 2>&1; then
+if gcloud compute target-https-proxies describe tp-mcp-countries-poc --region="${REGION}" --project="${APIGEE_PROJECT_ID}" >/dev/null 2>&1; then
+  skip "Southbound TargetHTTPSProxy 'tp-mcp-countries-poc' already exists."
+else
   gcloud compute target-https-proxies create tp-mcp-countries-poc \
     --url-map=um-mcp-countries-poc --ssl-certificates=cert-mcp-countries-sb-v1 \
     --region="${REGION}" --project="${APIGEE_PROJECT_ID}"
 fi
-if ! gcloud compute forwarding-rules describe fr-mcp-countries-poc --region="${REGION}" --project="${APIGEE_PROJECT_ID}" >/dev/null 2>&1; then
+if gcloud compute forwarding-rules describe fr-mcp-countries-poc --region="${REGION}" --project="${APIGEE_PROJECT_ID}" >/dev/null 2>&1; then
+  skip "Southbound ForwardingRule 'fr-mcp-countries-poc' already exists."
+else
   gcloud compute forwarding-rules create fr-mcp-countries-poc \
     --load-balancing-scheme=INTERNAL_MANAGED --network=vpc-apigee-mcp \
     --subnet=subnet-apigee-mcp-backend --address=ip-ilb-mcp-countries --ports=443 \
     --region="${REGION}" --target-https-proxy=tp-mcp-countries-poc \
     --target-https-proxy-region="${REGION}" --project="${APIGEE_PROJECT_ID}"
 fi
-if ! gcloud compute service-attachments describe sa-psc-mcp-countries --region="${REGION}" --project="${APIGEE_PROJECT_ID}" >/dev/null 2>&1; then
+if gcloud compute service-attachments describe sa-psc-mcp-countries --region="${REGION}" --project="${APIGEE_PROJECT_ID}" >/dev/null 2>&1; then
+  skip "Southbound PSC ServiceAttachment 'sa-psc-mcp-countries' already exists."
+else
   gcloud compute service-attachments create sa-psc-mcp-countries \
     --region="${REGION}" --producer-forwarding-rule=fr-mcp-countries-poc \
     --connection-preference=ACCEPT_AUTOMATIC --nat-subnets=subnet-apigee-mcp-psc-nat \
@@ -978,78 +1392,119 @@ fi
 
 SB_SERVICE_ATTACHMENT="projects/${APIGEE_PROJECT_ID}/regions/${REGION}/serviceAttachments/sa-psc-mcp-countries"
 EA_URL="https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}/endpointAttachments/ea-mcp-countries"
-if [[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(get_token)" "${EA_URL}")" != "200" ]]; then
-  info "Creating Apigee Southbound EndpointAttachment 'ea-mcp-countries'..."
-  OP_EA="$(curl -s -X POST \
-    "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}/endpointAttachments?endpointAttachmentId=ea-mcp-countries" \
-    -H "Authorization: Bearer $(get_token)" -H "Content-Type: application/json" \
-    -d "{\"location\": \"${REGION}\", \"serviceAttachment\": \"${SB_SERVICE_ATTACHMENT}\"}" | jq -r '.name')"
-  while [[ "$(curl -s -H "Authorization: Bearer $(get_token)" "https://apigee.googleapis.com/v1/${OP_EA}" | jq -r '.done // false')" != "true" ]]; do
+EA_STATE="$(curl -s -H "Authorization: Bearer $(get_token)" "${EA_URL}" | jq -r '.state // "MISSING"' 2>/dev/null || echo "MISSING")"
+if [[ "${EA_STATE}" == "ACTIVE" ]]; then
+  skip "Apigee Southbound EndpointAttachment 'ea-mcp-countries' already exists (ACTIVE)."
+elif [[ "${EA_STATE}" == "CREATING" ]]; then
+  info "Apigee Southbound EndpointAttachment 'ea-mcp-countries' is CREATING; waiting until ACTIVE..."
+  while [[ "$(curl -s -H "Authorization: Bearer $(get_token)" "${EA_URL}" | jq -r '.state // ""' 2>/dev/null)" != "ACTIVE" ]]; do
     sleep 10
   done
+else
+  info "Creating Apigee Southbound EndpointAttachment 'ea-mcp-countries'..."
+  apigee_post_and_wait \
+    "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}/endpointAttachments?endpointAttachmentId=ea-mcp-countries" \
+    "{\"location\": \"${REGION}\", \"serviceAttachment\": \"${SB_SERVICE_ATTACHMENT}\"}" \
+    "Southbound EndpointAttachment 'ea-mcp-countries'" 10
 fi
 
-EA_HOST="$(curl -s -H "Authorization: Bearer $(get_token)" "${EA_URL}" | jq -r '.host')"
+EA_HOST=""
+for _ in {1..15}; do
+  EA_HOST="$(curl -s -H "Authorization: Bearer $(get_token)" "${EA_URL}" | jq -r '.host // empty' 2>/dev/null || true)"
+  [[ -n "${EA_HOST}" ]] && break
+  sleep 4
+done
+if [[ -z "${EA_HOST}" ]]; then
+  err "Could not retrieve .host from EndpointAttachment ${EA_URL}"
+  exit 1
+fi
 save_env
 ok "Apigee Southbound EndpointAttachment IP (EA_HOST): ${EA_HOST}"
 
-cat > certs/countries-sb-ext.cnf <<EOF
+CURRENT_SB_CERT="$(gcloud compute target-https-proxies describe tp-mcp-countries-poc --region="${REGION}" --project="${APIGEE_PROJECT_ID}" --format='value(sslCertificates)' 2>/dev/null || true)"
+if gcloud compute ssl-certificates describe cert-mcp-countries-sb-v2 --region="${REGION}" --project="${APIGEE_PROJECT_ID}" >/dev/null 2>&1 && [[ "${CURRENT_SB_CERT}" == *"cert-mcp-countries-sb-v2"* ]]; then
+  skip "Southbound TargetHTTPSProxy already using Pass-2 SAN certificate 'cert-mcp-countries-sb-v2' (IP:${EA_HOST})."
+else
+  if ! gcloud compute ssl-certificates describe cert-mcp-countries-sb-v2 --region="${REGION}" --project="${APIGEE_PROJECT_ID}" >/dev/null 2>&1; then
+    ensure_sb_csr
+    cat > certs/countries-sb-ext.cnf <<EOF
 [v3_req]
 basicConstraints = CA:FALSE
 keyUsage = critical, digitalSignature, keyEncipherment
 extendedKeyUsage = serverAuth
 subjectAltName = DNS:${COUNTRIES_HOST},IP:${SB_ILB_IP},IP:${HUB_APIGEE_ILB_IP},IP:${EA_HOST}
 EOF
-openssl x509 -req -in certs/mcp-countries-sb.csr -CA certs/ca.crt -CAkey certs/ca.key -CAcreateserial \
-  -out certs/mcp-countries-sb.crt -days 825 -sha256 -extensions v3_req -extfile certs/countries-sb-ext.cnf
-
-if ! gcloud compute ssl-certificates describe cert-mcp-countries-sb-v2 --region="${REGION}" --project="${APIGEE_PROJECT_ID}" >/dev/null 2>&1; then
-  gcloud compute ssl-certificates create cert-mcp-countries-sb-v2 \
-    --certificate=certs/mcp-countries-sb.crt --private-key=certs/mcp-countries-sb.key \
-    --region="${REGION}" --project="${APIGEE_PROJECT_ID}"
+    openssl x509 -req -in certs/mcp-countries-sb.csr -CA certs/ca.crt -CAkey certs/ca.key -CAcreateserial \
+      -out certs/mcp-countries-sb.crt -days 825 -sha256 -extensions v3_req -extfile certs/countries-sb-ext.cnf
+    gcloud compute ssl-certificates create cert-mcp-countries-sb-v2 \
+      --certificate=certs/mcp-countries-sb.crt --private-key=certs/mcp-countries-sb.key \
+      --region="${REGION}" --project="${APIGEE_PROJECT_ID}"
+  fi
+  gcloud compute target-https-proxies update tp-mcp-countries-poc \
+    --ssl-certificates=cert-mcp-countries-sb-v2 --region="${REGION}" --project="${APIGEE_PROJECT_ID}" >/dev/null
+  ok "Updated Southbound Target HTTPS Proxy with Pass-2 SAN certificate (IP:${EA_HOST})."
 fi
-gcloud compute target-https-proxies update tp-mcp-countries-poc \
-  --ssl-certificates=cert-mcp-countries-sb-v2 --region="${REGION}" --project="${APIGEE_PROJECT_ID}" >/dev/null
-ok "Updated Southbound Target HTTPS Proxy with Pass-2 SAN certificate (IP:${EA_HOST})."
 
 # ------------------------------------------------------------------------------
 # Stage 8: Render, Package & Deploy Apigee X Proxy (country-facts-mcp)
 # ------------------------------------------------------------------------------
 stage "Stage 8: Deploy Apigee X Proxy 'country-facts-mcp'"
 
-sed \
-  -e "s|__EA_HOST__|${EA_HOST}|g" \
-  -e "s|__CLOUD_RUN_URL__|${CLOUD_RUN_URL}|g" \
-  apigee_bundles/country-facts-mcp/apiproxy/targets/default.xml.tmpl \
-  > apigee_bundles/country-facts-mcp/apiproxy/targets/default.xml
+DEPLOYED_REV="$(curl -s -H "Authorization: Bearer $(get_token)" \
+  "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}/environments/eval-mcp/apis/country-facts-mcp/deployments" \
+  | jq -r '.deployments[0].revision // empty' 2>/dev/null || true)"
 
-(cd apigee_bundles/country-facts-mcp && zip -qr ../../country-facts-mcp.zip apiproxy)
+if [[ -n "${DEPLOYED_REV}" && "${REDEPLOY_PROXY}" != "true" ]]; then
+  skip "Apigee proxy 'country-facts-mcp' (revision ${DEPLOYED_REV}) already deployed to 'eval-mcp'. Pass --redeploy-proxy to update."
+else
+  sed \
+    -e "s|__EA_HOST__|${EA_HOST}|g" \
+    -e "s|__CLOUD_RUN_URL__|${CLOUD_RUN_URL}|g" \
+    apigee_bundles/country-facts-mcp/apiproxy/targets/default.xml.tmpl \
+    > apigee_bundles/country-facts-mcp/apiproxy/targets/default.xml
 
-REV="$(curl -s -X POST \
-  "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}/apis?action=import&name=country-facts-mcp" \
-  -H "Authorization: Bearer $(get_token)" \
-  -F "file=@country-facts-mcp.zip" | jq -r '.revision')"
+  (cd apigee_bundles/country-facts-mcp && zip -qr ../../country-facts-mcp.zip apiproxy)
 
-curl -s -X POST \
-  "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}/environments/eval-mcp/apis/country-facts-mcp/revisions/${REV}/deployments?override=true&serviceAccount=sa-apigee-invoker@${APIGEE_PROJECT_ID}.iam.gserviceaccount.com" \
-  -H "Authorization: Bearer $(get_token)" >/dev/null
-ok "Deployed Apigee proxy 'country-facts-mcp' revision ${REV} as sa-apigee-invoker."
+  IMPORT_RESP="$(curl -s -X POST \
+    "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}/apis?action=import&name=country-facts-mcp" \
+    -H "Authorization: Bearer $(get_token)" \
+    -F "file=@country-facts-mcp.zip")"
+  REV="$(echo "${IMPORT_RESP}" | jq -r '.revision // empty' 2>/dev/null || true)"
+  if [[ -z "${REV}" || "${REV}" == "null" ]]; then
+    err "Failed importing Apigee proxy 'country-facts-mcp': ${IMPORT_RESP}"
+    exit 1
+  fi
+
+  DEPLOY_RESP="$(curl -s -X POST \
+    "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}/environments/eval-mcp/apis/country-facts-mcp/revisions/${REV}/deployments?override=true&serviceAccount=sa-apigee-invoker@${APIGEE_PROJECT_ID}.iam.gserviceaccount.com" \
+    -H "Authorization: Bearer $(get_token)")"
+  if echo "${DEPLOY_RESP}" | jq -e '.error' >/dev/null 2>&1; then
+    err "Failed deploying Apigee proxy 'country-facts-mcp': ${DEPLOY_RESP}"
+    exit 1
+  fi
+  ok "Deployed Apigee proxy 'country-facts-mcp' revision ${REV} as sa-apigee-invoker."
+fi
 
 # ------------------------------------------------------------------------------
 # Stage 9: Northbound Consumer PSC NEG, Hub ALB, DNS & Agent Registry
 # ------------------------------------------------------------------------------
 stage "Stage 9: Northbound PSC NEG, Hub HTTPS ALB, DNS & Agent Registry"
 
-if ! gcloud compute addresses describe ip-ilb-apigee-countries --region="${REGION}" --project="${HUB_PROJECT_ID}" >/dev/null 2>&1; then
+if gcloud compute addresses describe ip-ilb-apigee-countries --region="${REGION}" --project="${HUB_PROJECT_ID}" >/dev/null 2>&1; then
+  skip "Hub Northbound ILB IP 'ip-ilb-apigee-countries' (${HUB_APIGEE_ILB_IP}) already exists."
+else
   gcloud compute addresses create ip-ilb-apigee-countries \
     --region="${REGION}" --subnet=subnet-ilb-backend \
     --addresses="${HUB_APIGEE_ILB_IP}" --project="${HUB_PROJECT_ID}"
 fi
 
-if [[ ! -f certs/mcp-countries.key ]]; then
-  openssl genrsa -out certs/mcp-countries.key 2048
-fi
-cat > certs/countries-ext.cnf <<EOF
+if gcloud compute ssl-certificates describe cert-mcp-countries-hub --region="${REGION}" --project="${HUB_PROJECT_ID}" >/dev/null 2>&1; then
+  skip "Hub Northbound SSL certificate 'cert-mcp-countries-hub' already exists."
+else
+  if [[ ! -f certs/mcp-countries.key ]]; then
+    openssl genrsa -out certs/mcp-countries.key 2048
+  fi
+  cat > certs/countries-ext.cnf <<EOF
 [req]
 distinguished_name = dn
 req_extensions = v3_req
@@ -1062,23 +1517,25 @@ keyUsage = critical, digitalSignature, keyEncipherment
 extendedKeyUsage = serverAuth
 subjectAltName = DNS:${COUNTRIES_HOST},IP:${HUB_APIGEE_ILB_IP}
 EOF
-openssl req -new -key certs/mcp-countries.key -out certs/mcp-countries.csr -config certs/countries-ext.cnf
-openssl x509 -req -in certs/mcp-countries.csr -CA certs/ca.crt -CAkey certs/ca.key -CAcreateserial \
-  -out certs/mcp-countries.crt -days 825 -sha256 -extensions v3_req -extfile certs/countries-ext.cnf
-
-if ! gcloud compute ssl-certificates describe cert-mcp-countries-hub --region="${REGION}" --project="${HUB_PROJECT_ID}" >/dev/null 2>&1; then
+  openssl req -new -key certs/mcp-countries.key -out certs/mcp-countries.csr -config certs/countries-ext.cnf
+  openssl x509 -req -in certs/mcp-countries.csr -CA certs/ca.crt -CAkey certs/ca.key -CAcreateserial \
+    -out certs/mcp-countries.crt -days 825 -sha256 -extensions v3_req -extfile certs/countries-ext.cnf
   gcloud compute ssl-certificates create cert-mcp-countries-hub \
     --certificate=certs/mcp-countries.crt --private-key=certs/mcp-countries.key \
     --region="${REGION}" --project="${HUB_PROJECT_ID}"
 fi
-if ! gcloud compute network-endpoint-groups describe neg-psc-apigee-countries --region="${REGION}" --project="${HUB_PROJECT_ID}" >/dev/null 2>&1; then
+if gcloud compute network-endpoint-groups describe neg-psc-apigee-countries --region="${REGION}" --project="${HUB_PROJECT_ID}" >/dev/null 2>&1; then
+  skip "Northbound PSC NEG 'neg-psc-apigee-countries' already exists."
+else
   gcloud compute network-endpoint-groups create neg-psc-apigee-countries \
     --network-endpoint-type=private-service-connect \
     --psc-target-service="${APIGEE_NB_SERVICE_ATTACHMENT}" \
     --network=vpc-mcp-internal --subnet=subnet-ilb-backend \
     --region="${REGION}" --project="${HUB_PROJECT_ID}"
 fi
-if ! gcloud compute backend-services describe bs-apigee-countries --region="${REGION}" --project="${HUB_PROJECT_ID}" >/dev/null 2>&1; then
+if gcloud compute backend-services describe bs-apigee-countries --region="${REGION}" --project="${HUB_PROJECT_ID}" >/dev/null 2>&1; then
+  skip "Northbound BackendService 'bs-apigee-countries' already exists."
+else
   gcloud compute backend-services create bs-apigee-countries \
     --load-balancing-scheme=INTERNAL_MANAGED --protocol=HTTPS \
     --region="${REGION}" --project="${HUB_PROJECT_ID}"
@@ -1086,32 +1543,43 @@ if ! gcloud compute backend-services describe bs-apigee-countries --region="${RE
     --network-endpoint-group=neg-psc-apigee-countries \
     --network-endpoint-group-region="${REGION}" --region="${REGION}" --project="${HUB_PROJECT_ID}"
 fi
-if ! gcloud compute url-maps describe um-apigee-countries --region="${REGION}" --project="${HUB_PROJECT_ID}" >/dev/null 2>&1; then
+if gcloud compute url-maps describe um-apigee-countries --region="${REGION}" --project="${HUB_PROJECT_ID}" >/dev/null 2>&1; then
+  skip "Northbound URL Map 'um-apigee-countries' already exists."
+else
   gcloud compute url-maps create um-apigee-countries \
     --default-service=bs-apigee-countries --region="${REGION}" --project="${HUB_PROJECT_ID}"
 fi
-if ! gcloud compute target-https-proxies describe tp-apigee-countries --region="${REGION}" --project="${HUB_PROJECT_ID}" >/dev/null 2>&1; then
+if gcloud compute target-https-proxies describe tp-apigee-countries --region="${REGION}" --project="${HUB_PROJECT_ID}" >/dev/null 2>&1; then
+  skip "Northbound TargetHTTPSProxy 'tp-apigee-countries' already exists."
+else
   gcloud compute target-https-proxies create tp-apigee-countries \
     --url-map=um-apigee-countries --ssl-certificates=cert-mcp-countries-hub \
     --region="${REGION}" --project="${HUB_PROJECT_ID}"
 fi
-if ! gcloud compute forwarding-rules describe fr-apigee-countries --region="${REGION}" --project="${HUB_PROJECT_ID}" >/dev/null 2>&1; then
+if gcloud compute forwarding-rules describe fr-apigee-countries --region="${REGION}" --project="${HUB_PROJECT_ID}" >/dev/null 2>&1; then
+  skip "Northbound ForwardingRule 'fr-apigee-countries' already exists."
+else
   gcloud compute forwarding-rules create fr-apigee-countries \
     --load-balancing-scheme=INTERNAL_MANAGED --network=vpc-mcp-internal \
     --subnet=subnet-ilb-backend --address=ip-ilb-apigee-countries --ports=443 \
     --region="${REGION}" --target-https-proxy=tp-apigee-countries \
     --target-https-proxy-region="${REGION}" --project="${HUB_PROJECT_ID}"
 fi
-if ! gcloud dns record-sets describe "${COUNTRIES_HOST}." --type=A --zone=zone-corp-internal --project="${HUB_PROJECT_ID}" >/dev/null 2>&1; then
+if gcloud dns record-sets describe "${COUNTRIES_HOST}." --type=A --zone=zone-corp-internal --project="${HUB_PROJECT_ID}" >/dev/null 2>&1; then
+  skip "Cloud DNS A record '${COUNTRIES_HOST}.' -> ${HUB_APIGEE_ILB_IP} already exists."
+else
   gcloud dns record-sets create "${COUNTRIES_HOST}." \
     --zone=zone-corp-internal --type=A --ttl=60 \
     --rrdatas="${HUB_APIGEE_ILB_IP}" --project="${HUB_PROJECT_ID}"
 fi
+
 AR_SVC_URL="https://agentregistry.googleapis.com/v1/projects/${HUB_PROJECT_ID}/locations/${REGION}/services/mcp-countries-poc"
-if [[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(get_token)" -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" "${AR_SVC_URL}")" != "200" ]]; then
+if [[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(get_token)" -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" "${AR_SVC_URL}")" == "200" ]]; then
+  skip "Agent Registry service 'mcp-countries-poc' already registered."
+else
   info "Registering 'mcp-countries-poc' in Hub Agent Registry..."
   TOOLSPEC_JSON="$(cat cfg/toolspec_countries.json)"
-  AR_OP="$(curl -s -X POST \
+  AR_RESP="$(curl -s -X POST \
     "https://agentregistry.googleapis.com/v1/projects/${HUB_PROJECT_ID}/locations/${REGION}/services?serviceId=mcp-countries-poc" \
     -H "Authorization: Bearer $(get_token)" \
     -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" \
@@ -1121,12 +1589,9 @@ if [[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(get_
       \"description\": \"Internal Country Facts StreamableHTTP MCP server hosted in ${APIGEE_PROJECT_ID} behind Apigee X over Northbound and Southbound PSC (${COUNTRIES_MCP_URL}).\",
       \"interfaces\": [{\"protocolBinding\": \"JSONRPC\", \"url\": \"${COUNTRIES_MCP_URL}\"}],
       \"mcpServerSpec\": {\"type\": \"TOOL_SPEC\", \"content\": ${TOOLSPEC_JSON}}
-    }" | jq -r '.name // empty')"
-  if [[ -n "${AR_OP}" ]]; then
-    while [[ "$(curl -s -H "Authorization: Bearer $(get_token)" -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" "https://agentregistry.googleapis.com/v1/${AR_OP}" | jq -r '.done // false')" != "true" ]]; do
-      sleep 3
-    done
-  fi
+    }")"
+  wait_gcp_op "https://agentregistry.googleapis.com/v1" "${AR_RESP}" "Agent Registry service 'mcp-countries-poc'" 3
+  ok "Registered 'mcp-countries-poc' in Hub Agent Registry."
 fi
 
 MCP_COUNTRIES_REGISTRY_URI=""
@@ -1135,10 +1600,14 @@ for _ in {1..15}; do
     -H "Authorization: Bearer $(get_token)" \
     -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" \
     "https://agentregistry.googleapis.com/v1alpha/projects/${HUB_PROJECT_ID}/locations/${REGION}/mcpServers" \
-    | jq -r --arg url "${COUNTRIES_MCP_URL}" '.mcpServers[]? | select(.interfaces[]?.url == $url) | .name' | head -n 1)"
+    | jq -r --arg url "${COUNTRIES_MCP_URL}" '.mcpServers[]? | select(.interfaces[]?.url == $url) | .name' 2>/dev/null | head -n 1)"
   [[ -n "${MCP_COUNTRIES_REGISTRY_URI}" ]] && break
   sleep 4
 done
+if [[ -z "${MCP_COUNTRIES_REGISTRY_URI}" ]]; then
+  err "Could not resolve Agent Registry mcpServer URI for ${COUNTRIES_MCP_URL}"
+  exit 1
+fi
 save_env
 ok "Agent Registry MCP Server URI: ${MCP_COUNTRIES_REGISTRY_URI}"
 
@@ -1147,11 +1616,22 @@ ok "Agent Registry MCP Server URI: ${MCP_COUNTRIES_REGISTRY_URI}"
 # ------------------------------------------------------------------------------
 stage "Stage 10: Connect Gemini Enterprise & Run Verification"
 
-if [[ -z "${GE_COUNTRIES_COLLECTION_ID:-}" ]]; then
-  COLLECTION_DISPLAY_NAME="mcp-countries-apigee-collection"
-  COLLECTION_ID="mcp-countries-apigee-collection-$(date +%s)"
+COLLECTION_DISPLAY_NAME="mcp-countries-apigee-collection"
+DISCOVERED_COLL="$(curl -s \
+  "https://${GE_LOCATION}-discoveryengine.googleapis.com/v1alpha/projects/${HUB_PROJECT_ID}/locations/${GE_LOCATION}/collections" \
+  -H "Authorization: Bearer $(get_token)" \
+  -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" \
+  | jq -r --arg dn "${COLLECTION_DISPLAY_NAME}" --arg saved "${GE_COUNTRIES_COLLECTION_ID:-}" \
+    '.collections[]? | select(.displayName == $dn or ($saved != "" and (.name | endswith("/" + $saved)))) | .name | split("/") | last' 2>/dev/null | head -n 1)"
 
-  curl -s -X POST \
+if [[ -n "${DISCOVERED_COLL}" ]]; then
+  GE_COUNTRIES_COLLECTION_ID="${DISCOVERED_COLL}"
+  save_env
+  skip "Discovery Engine collection '${GE_COUNTRIES_COLLECTION_ID}' already exists."
+else
+  COLLECTION_ID="mcp-countries-apigee-collection-$(date +%s)"
+  info "Creating Gemini Enterprise REGISTRY_MCP data connector collection '${COLLECTION_ID}'..."
+  SETUP_DC_RESP="$(curl -s -X POST \
     "https://${GE_LOCATION}-discoveryengine.googleapis.com/v1alpha/projects/${HUB_PROJECT_ID}/locations/${GE_LOCATION}:setUpDataConnector" \
     -H "Authorization: Bearer $(get_token)" \
     -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" \
@@ -1187,48 +1667,67 @@ if [[ -z "${GE_COUNTRIES_COLLECTION_ID:-}" ]]; then
           }
         }
       }
-    }" >/dev/null
+    }")"
+  if echo "${SETUP_DC_RESP}" | jq -e '.error' >/dev/null 2>&1; then
+    err "setUpDataConnector failed: $(echo "${SETUP_DC_RESP}" | jq -c '.error')"
+    exit 1
+  fi
 
-  while true; do
+  GE_COUNTRIES_COLLECTION_ID=""
+  for _ in {1..60}; do
     GE_COUNTRIES_COLLECTION_ID="$(curl -s \
       "https://${GE_LOCATION}-discoveryengine.googleapis.com/v1alpha/projects/${HUB_PROJECT_ID}/locations/${GE_LOCATION}/collections" \
       -H "Authorization: Bearer $(get_token)" \
       -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" \
-      | jq -r --arg cid "${COLLECTION_ID}" '.collections[]? | select(.name | endswith("/" + $cid)) | .name | split("/") | last')"
+      | jq -r --arg cid "${COLLECTION_ID}" '.collections[]? | select(.name | endswith("/" + $cid)) | .name | split("/") | last' 2>/dev/null || true)"
     [[ -n "${GE_COUNTRIES_COLLECTION_ID}" ]] && break
     sleep 5
   done
+  if [[ -z "${GE_COUNTRIES_COLLECTION_ID}" ]]; then
+    err "Timed out waiting for Discovery Engine collection '${COLLECTION_ID}' to appear."
+    exit 1
+  fi
   save_env
 fi
 
-curl -s -X PATCH \
-  "https://discoveryengine.googleapis.com/v1alpha/projects/${HUB_PROJECT_ID}/locations/global/collections/${GE_COUNTRIES_COLLECTION_ID}/dataConnector?updateMask=actionConfig" \
-  -H "Authorization: Bearer $(get_token)" \
-  -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" \
-  -H "Content-Type: application/json" \
-  -d "{
-    \"name\": \"projects/${HUB_PROJECT_ID}/locations/global/collections/${GE_COUNTRIES_COLLECTION_ID}/dataConnector\",
-    \"actionConfig\": {
-      \"isActionConfigured\": true,
-      \"createBapConnection\": true,
-      \"actionParams\": {
-        \"auth_type\": \"OAUTH\",
-        \"instance_uri\": \"${COUNTRIES_MCP_URL}\",
-        \"auth_uri\": \"https://accounts.google.com/o/oauth2/v2/auth\",
-        \"auth_uri_params\": \"&access_type=offline&prompt=consent\",
-        \"token_uri\": \"https://oauth2.googleapis.com/token\",
-        \"client_id\": \"${OAUTH_CLIENT_ID}\",
-        \"client_secret\": \"${OAUTH_CLIENT_SECRET}\",
-        \"scopes\": \"openid email profile\",
-        \"client_secret_basic_override\": true,
-        \"mcp_server_source\": \"REGISTRY_MCP\",
-        \"registry_mcp_server_name\": \"${MCP_COUNTRIES_REGISTRY_URI}\",
-        \"mcp_agent_instructions\": \"COUNTRY FACTS APIGEE MCP AGENT: Always invoke list_countries, get_country_facts, or get_authenticated_caller for any question about countries, capitals, ISO codes, populations, currencies, languages, timezones, Japan, Brazil, Norway, Kenya, Canada, Australia, or Apigee X proxy mediation.\",
-        \"use_agent_gateway_egress\": true,
-        \"agent_gateway_engine\": \"projects/${HUB_PROJECT_ID}/locations/global/collections/default_collection/engines/${GE_APP_ID}\"
+DC_URL="https://discoveryengine.googleapis.com/v1alpha/projects/${HUB_PROJECT_ID}/locations/global/collections/${GE_COUNTRIES_COLLECTION_ID}/dataConnector"
+DC_CONFIGURED="$(curl -s -H "Authorization: Bearer $(get_token)" -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" "${DC_URL}" \
+  | jq -r --arg reg "${MCP_COUNTRIES_REGISTRY_URI}" \
+    'if (.actionConfig.isActionConfigured == true and .actionConfig.actionParams.registry_mcp_server_name == $reg) then "true" else "false" end' 2>/dev/null || echo "false")"
+
+if [[ "${DC_CONFIGURED}" == "true" ]]; then
+  skip "Gemini Enterprise REGISTRY_MCP connector '${GE_COUNTRIES_COLLECTION_ID}' actionConfig already active."
+else
+  info "Activating Gemini Enterprise REGISTRY_MCP connector actionConfig (${GE_COUNTRIES_COLLECTION_ID})..."
+  curl -s -X PATCH \
+    "${DC_URL}?updateMask=actionConfig" \
+    -H "Authorization: Bearer $(get_token)" \
+    -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" \
+    -H "Content-Type: application/json" \
+    -d "{
+      \"name\": \"projects/${HUB_PROJECT_ID}/locations/global/collections/${GE_COUNTRIES_COLLECTION_ID}/dataConnector\",
+      \"actionConfig\": {
+        \"isActionConfigured\": true,
+        \"createBapConnection\": true,
+        \"actionParams\": {
+          \"auth_type\": \"OAUTH\",
+          \"instance_uri\": \"${COUNTRIES_MCP_URL}\",
+          \"auth_uri\": \"https://accounts.google.com/o/oauth2/v2/auth\",
+          \"auth_uri_params\": \"&access_type=offline&prompt=consent\",
+          \"token_uri\": \"https://oauth2.googleapis.com/token\",
+          \"client_id\": \"${OAUTH_CLIENT_ID}\",
+          \"client_secret\": \"${OAUTH_CLIENT_SECRET}\",
+          \"scopes\": \"openid email profile\",
+          \"client_secret_basic_override\": true,
+          \"mcp_server_source\": \"REGISTRY_MCP\",
+          \"registry_mcp_server_name\": \"${MCP_COUNTRIES_REGISTRY_URI}\",
+          \"mcp_agent_instructions\": \"COUNTRY FACTS APIGEE MCP AGENT: Always invoke list_countries, get_country_facts, or get_authenticated_caller for any question about countries, capitals, ISO codes, populations, currencies, languages, timezones, Japan, Brazil, Norway, Kenya, Canada, Australia, or Apigee X proxy mediation.\",
+          \"use_agent_gateway_egress\": true,
+          \"agent_gateway_engine\": \"projects/${HUB_PROJECT_ID}/locations/global/collections/default_collection/engines/${GE_APP_ID}\"
+        }
       }
-    }
-  }" >/dev/null
-ok "Activated Gemini Enterprise REGISTRY_MCP connector (${GE_COUNTRIES_COLLECTION_ID})."
+    }" >/dev/null
+  ok "Activated Gemini Enterprise REGISTRY_MCP connector (${GE_COUNTRIES_COLLECTION_ID})."
+fi
 
 ./verify.sh

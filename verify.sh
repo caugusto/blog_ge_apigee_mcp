@@ -11,6 +11,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
+if [[ ! -t 1 ]]; then
+  export CLOUDSDK_CORE_DISABLE_COLOR=1
+fi
+
+REBUILD_JOB=false
+for arg in "$@"; do
+  [[ "${arg}" == "--rebuild" ]] && REBUILD_JOB=true
+done
+
 ENV_FILE="${ENV_FILE:-.env}"
 if [[ ! -f "${ENV_FILE}" ]]; then
   echo "ERROR: ${ENV_FILE} not found. Run ./deploy.sh first." >&2
@@ -30,21 +39,29 @@ fi
 
 echo ""
 echo "=== [2/3] Running In-VPC Northbound & Southbound PSC + Apigee X Verifier Job ==="
-cp certs/ca.crt verifier_job/ca.crt
-
-gcloud run jobs deploy mcp-countries-vpc-verifier \
-  --source=verifier_job \
-  --region="${REGION}" \
-  --project="${HUB_PROJECT_ID}" \
-  --service-account="sa-mcp-verifier@${HUB_PROJECT_ID}.iam.gserviceaccount.com" \
-  --network=vpc-mcp-internal \
-  --subnet=subnet-ilb-backend \
-  --vpc-egress=private-ranges-only \
-  --max-retries=0 \
-  --set-env-vars="COUNTRIES_HOST=${COUNTRIES_HOST},EXPECTED_HUB_ILB_IP=${HUB_APIGEE_ILB_IP},EXPECTED_APIGEE_PROJECT=${APIGEE_PROJECT_ID}" \
-  --execute-now \
-  --wait \
-  --quiet
+if [[ "${REBUILD_JOB}" != "true" ]] && gcloud run jobs describe mcp-countries-vpc-verifier --region="${REGION}" --project="${HUB_PROJECT_ID}" >/dev/null 2>&1; then
+  echo "[SKIP] Cloud Run Job 'mcp-countries-vpc-verifier' already built; executing directly..."
+  gcloud run jobs execute mcp-countries-vpc-verifier \
+    --region="${REGION}" \
+    --project="${HUB_PROJECT_ID}" \
+    --wait \
+    --quiet
+else
+  cp certs/ca.crt verifier_job/ca.crt
+  gcloud run jobs deploy mcp-countries-vpc-verifier \
+    --source=verifier_job \
+    --region="${REGION}" \
+    --project="${HUB_PROJECT_ID}" \
+    --service-account="sa-mcp-verifier@${HUB_PROJECT_ID}.iam.gserviceaccount.com" \
+    --network=vpc-mcp-internal \
+    --subnet=subnet-ilb-backend \
+    --vpc-egress=private-ranges-only \
+    --max-retries=0 \
+    --set-env-vars="COUNTRIES_HOST=${COUNTRIES_HOST},EXPECTED_HUB_ILB_IP=${HUB_APIGEE_ILB_IP},EXPECTED_APIGEE_PROJECT=${APIGEE_PROJECT_ID}" \
+    --execute-now \
+    --wait \
+    --quiet
+fi
 
 echo ""
 echo "=== Verifier Job Output (Cloud Logging) ==="

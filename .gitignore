@@ -19,6 +19,7 @@ cfg/allow_custom_mcp_policy.yaml
 cfg/policy_*.yaml
 cfg/iap-authz-ext.yaml
 cfg/uap-allow-registered.json
+cfg/.iam_*.json
 verifier_job/ca.crt
 
 # Python & OS artifacts

@@ -509,13 +509,29 @@ while [[ "$(curl -s -H "Authorization: Bearer $(get_token)" "https://apigee.goog
   sleep 10
 done
 
-curl -s -X POST "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}/environments" \
-  -H "Authorization: Bearer $(get_token)" -H "Content-Type: application/json" \
-  -d '{"name": "eval-mcp", "displayName": "Internal MCP Evaluation Env", "deploymentProxyType": "PROGRAMMABLE", "apiProxyType": "PROGRAMMABLE"}'
+# Wait for Apigee's automatic post-org AddonsConfig update lock to settle
+wait_apigee_idle() {
+  while [[ "$(curl -s -H "Authorization: Bearer $(get_token)" "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}/operations" | jq -r '[.operations[]? | select(.metadata.state == "IN_PROGRESS")] | length')" != "0" ]]; do
+    sleep 5
+  done
+}
+sleep 3 && wait_apigee_idle
 
-curl -s -X POST "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}/envgroups" \
+OP_ENV=$(curl -s -X POST "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}/environments" \
   -H "Authorization: Bearer $(get_token)" -H "Content-Type: application/json" \
-  -d "{\"name\": \"internal-mcp-group\", \"hostnames\": [\"${COUNTRIES_HOST}\"]}"
+  -d '{"name": "eval-mcp", "displayName": "Internal MCP Evaluation Env", "deploymentProxyType": "PROGRAMMABLE", "apiProxyType": "PROGRAMMABLE"}' | jq -r '.name')
+if [[ "${OP_ENV}" == organizations/*/operations/* ]]; then
+  while [[ "$(curl -s -H "Authorization: Bearer $(get_token)" "https://apigee.googleapis.com/v1/${OP_ENV}" | jq -r '.done // false')" != "true" ]]; do sleep 5; done
+fi
+wait_apigee_idle
+
+OP_EG_CREATE=$(curl -s -X POST "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}/envgroups" \
+  -H "Authorization: Bearer $(get_token)" -H "Content-Type: application/json" \
+  -d "{\"name\": \"internal-mcp-group\", \"hostnames\": [\"${COUNTRIES_HOST}\"]}" | jq -r '.name')
+if [[ "${OP_EG_CREATE}" == organizations/*/operations/* ]]; then
+  while [[ "$(curl -s -H "Authorization: Bearer $(get_token)" "https://apigee.googleapis.com/v1/${OP_EG_CREATE}" | jq -r '.done // false')" != "true" ]]; do sleep 5; done
+fi
+wait_apigee_idle
 
 OP_EG=$(curl -s -X POST "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}/envgroups/internal-mcp-group/attachments" \
   -H "Authorization: Bearer $(get_token)" -H "Content-Type: application/json" \
@@ -524,6 +540,7 @@ OP_EG=$(curl -s -X POST "https://apigee.googleapis.com/v1/organizations/${APIGEE
 while [[ "$(curl -s -H "Authorization: Bearer $(get_token)" "https://apigee.googleapis.com/v1/${OP_EG}" | jq -r '.done // false')" != "true" ]]; do
   sleep 5
 done
+wait_apigee_idle
 
 OP_INST=$(curl -s -X POST "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}/instances" \
   -H "Authorization: Bearer $(get_token)" -H "Content-Type: application/json" \
