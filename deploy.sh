@@ -47,8 +47,37 @@ warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 err()   { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 stage() { echo -e "\n${BLUE}==============================================================================${NC}\n${BLUE} $*${NC}\n${BLUE}==============================================================================${NC}"; }
 
+DETACHED_CLEANLY=false
+IAM_ROLE_GRANTED=false
+LAST_ERR_LINE=""
 rm -f cfg/.iam_*.json 2>/dev/null || true
-trap 'rm -f cfg/.iam_*.json 2>/dev/null || true' EXIT
+
+on_exit() {
+  local rc=$?
+  rm -f cfg/.iam_*.json 2>/dev/null || true
+  if [[ "${UNATTENDED_WORKER}" == "true" ]]; then
+    rm -f "${PID_FILE}" 2>/dev/null || true
+  fi
+  if [[ "${DETACHED_CLEANLY}" == "true" ]]; then
+    return 0
+  fi
+  echo ""
+  if [[ "${rc}" -ne 0 ]]; then
+    local loc_msg=""
+    [[ -n "${LAST_ERR_LINE}" ]] && loc_msg=" (near line ${LAST_ERR_LINE})"
+    echo -e "${RED}==============================================================================${NC}" >&2
+    echo -e "${RED} [STOPPED] Deployment exited with code ${rc}${loc_msg}.${NC}" >&2
+    echo -e "${RED} Re-run './deploy.sh --background' to resume from this exact stage${NC}" >&2
+    echo -e "${RED} (all completed resources and IAM bindings will be [SKIP]ped).${NC}" >&2
+    echo -e "${RED}==============================================================================${NC}" >&2
+  else
+    echo -e "${GREEN}==============================================================================${NC}"
+    echo -e "${GREEN} [COMPLETE] End-to-end deployment & verification finished successfully!${NC}"
+    echo -e "${GREEN}==============================================================================${NC}"
+  fi
+}
+trap 'LAST_ERR_LINE=$LINENO' ERR
+trap 'on_exit' EXIT
 
 if [[ "${UNATTENDED_WORKER}" != "true" && -f "${PID_FILE}" ]]; then
   OLD_PID="$(cat "${PID_FILE}" 2>/dev/null || true)"
@@ -131,6 +160,7 @@ ensure_project_iam_roles() {
         --role="${role}" \
         --condition=None --quiet --format=json > "${cache_file}.tmp" 2>/dev/null; then
         mv "${cache_file}.tmp" "${cache_file}"
+        IAM_ROLE_GRANTED=true
       else
         rm -f "${cache_file}.tmp"
         warn "Could not grant ${role} to ${member} on '${proj}' (continuing)."
@@ -329,6 +359,63 @@ wait_gcp_op() {
       return 0
     fi
     sleep "${sleep_sec}"
+  done
+}
+
+networkservices_post_with_iam_retry() {
+  local url="$1"
+  local body="$2"
+  local label="$3"
+  local poll_sleep="${4:-5}"
+  for attempt in {1..8}; do
+    local resp_json op_name
+    resp_json="$(curl -s -X POST "${url}" \
+      -H "Authorization: Bearer $(get_token)" \
+      -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" \
+      -H "Content-Type: application/json" \
+      -d "${body}")"
+    if echo "${resp_json}" | jq -e '.error' >/dev/null 2>&1; then
+      local err_str
+      err_str="$(echo "${resp_json}" | jq -c '.error')"
+      if [[ "${attempt}" -lt 8 && ( "${err_str}" == *"permission"* || "${err_str}" == *"PERMISSION_DENIED"* ) ]]; then
+        warn "${label}: Service Agent IAM still propagating (attempt ${attempt}/8); retrying in 30s..."
+        sleep 30
+        continue
+      fi
+      err "Failed starting ${label}: ${err_str}"
+      exit 1
+    fi
+    op_name="$(echo "${resp_json}" | jq -r '.name // empty' 2>/dev/null || true)"
+    if [[ -z "${op_name}" || "${op_name}" == "null" ]]; then
+      err "Failed starting ${label}: ${resp_json}"
+      exit 1
+    fi
+    local retry_needed=false
+    while true; do
+      local poll_json done_flag
+      poll_json="$(curl -s -H "Authorization: Bearer $(get_token)" -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" "https://networkservices.googleapis.com/v1/${op_name}")"
+      done_flag="$(echo "${poll_json}" | jq -r '.done // false' 2>/dev/null || echo "false")"
+      if [[ "${done_flag}" == "true" ]]; then
+        if echo "${poll_json}" | jq -e '.error' >/dev/null 2>&1; then
+          local op_err
+          op_err="$(echo "${poll_json}" | jq -c '.error')"
+          if [[ "${attempt}" -lt 8 && ( "${op_err}" == *"does not have permission"* || "${op_err}" == *"PERMISSION_DENIED"* ) ]]; then
+            warn "${label}: Agent Gateway Service Agent IAM still propagating globally (attempt ${attempt}/8); retrying in 30s..."
+            retry_needed=true
+            break
+          fi
+          err "${label} failed: ${op_err}"
+          exit 1
+        fi
+        return 0
+      fi
+      sleep "${poll_sleep}"
+    done
+    if [[ "${retry_needed}" == "true" ]]; then
+      sleep 30
+      continue
+    fi
+    return 0
   done
 }
 
@@ -649,6 +736,7 @@ if [[ "${BACKGROUND_MODE}" == "true" ]]; then
   echo "    tail -f ${LOG_FILE}"
   info "Check worker status anytime:"
   echo "    ps -p \$(cat ${PID_FILE})"
+  DETACHED_CLEANLY=true
   exit 0
 fi
 else
@@ -899,6 +987,7 @@ if ! project_has_member_any_role "${HUB_PROJECT_ID}" "serviceAccount:${AGW_SA}";
   rm -f "cfg/.iam_${HUB_PROJECT_ID}.json"
 fi
 
+IAM_ROLE_GRANTED=false
 ensure_project_iam_roles "${HUB_PROJECT_ID}" "serviceAccount:${AGW_SA}" \
   roles/agentgateway.serviceAgent \
   roles/compute.networkViewer \
@@ -916,15 +1005,14 @@ ACT_GET="https://networkservices.googleapis.com/v1/projects/${HUB_PROJECT_ID}/lo
 if [[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(get_token)" -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" "${ACT_GET}")" == "200" ]]; then
   skip "AgentConnectivityTemplate 'act-vpc-mcp-internal' already exists."
 else
-  info "Waiting 60s for Agent Gateway Service Agent IAM propagation..."
-  sleep 60
+  if [[ "${IAM_ROLE_GRANTED}" == "true" ]]; then
+    info "Waiting 60s for newly granted Agent Gateway Service Agent IAM roles to propagate..."
+    sleep 60
+  fi
   info "Creating AgentConnectivityTemplate 'act-vpc-mcp-internal'..."
-  ACT_RESP="$(curl -s -X POST \
+  networkservices_post_with_iam_retry \
     "https://networkservices.googleapis.com/v1/projects/${HUB_PROJECT_ID}/locations/${REGION}/agentConnectivityTemplates?agentConnectivityTemplateId=act-vpc-mcp-internal" \
-    -H "Authorization: Bearer $(get_token)" \
-    -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" \
-    -H "Content-Type: application/json" \
-    -d "{
+    "{
       \"accessPath\": \"AGENT_TO_ANYWHERE\",
       \"deploymentModel\": \"CENTRALIZED\",
       \"egressNetworkConfig\": {
@@ -939,8 +1027,8 @@ else
           \"additionalRoots\": \"PUBLICLY_TRUSTED_ROOTS\"
         }
       }
-    }")"
-  wait_gcp_op "https://networkservices.googleapis.com/v1" "${ACT_RESP}" "AgentConnectivityTemplate 'act-vpc-mcp-internal'" 5
+    }" \
+    "AgentConnectivityTemplate 'act-vpc-mcp-internal'" 5
   ok "Created AgentConnectivityTemplate 'act-vpc-mcp-internal'."
 fi
 
@@ -949,18 +1037,15 @@ if [[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(get_
   skip "Hub AgentGateway '${AGW_NAME}' already exists."
 else
   info "Creating Hub AgentGateway '${AGW_NAME}'..."
-  AGW_RESP="$(curl -s -X POST \
+  networkservices_post_with_iam_retry \
     "https://networkservices.googleapis.com/v1/projects/${HUB_PROJECT_ID}/locations/${REGION}/agentGateways?agentGatewayId=${AGW_NAME}" \
-    -H "Authorization: Bearer $(get_token)" \
-    -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" \
-    -H "Content-Type: application/json" \
-    -d "{
+    "{
       \"protocols\": [\"MCP\"],
       \"googleManaged\": {\"governedAccessPath\": \"AGENT_TO_ANYWHERE\"},
       \"agentConnectivityTemplate\": \"${ACT_URI}\",
       \"registries\": [\"//agentregistry.googleapis.com/projects/${HUB_PROJECT_ID}/locations/${REGION}\"]
-    }")"
-  wait_gcp_op "https://networkservices.googleapis.com/v1" "${AGW_RESP}" "AgentGateway '${AGW_NAME}'" 10
+    }" \
+    "AgentGateway '${AGW_NAME}'" 10
   ok "Created Hub AgentGateway '${AGW_NAME}'."
 fi
 
