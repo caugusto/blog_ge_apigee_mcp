@@ -1669,7 +1669,8 @@ else
     apigee_bundles/country-facts-mcp/apiproxy/targets/default.xml.tmpl \
     > apigee_bundles/country-facts-mcp/apiproxy/targets/default.xml
 
-  (cd apigee_bundles/country-facts-mcp && zip -qr ../../country-facts-mcp.zip apiproxy)
+  rm -f country-facts-mcp.zip
+  (cd apigee_bundles/country-facts-mcp && zip -qr ../../country-facts-mcp.zip apiproxy -x "*.tmpl" -x "*/.DS_Store" -x ".DS_Store")
 
   IMPORT_RESP="$(curl -s -X POST \
     "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}/apis?action=import&name=country-facts-mcp" \
