@@ -50,17 +50,27 @@ def http_post_mcp(
     if bearer_token:
         headers["Authorization"] = f"Bearer {bearer_token}"
 
-    req = urllib.request.Request(
-        MCP_URL,
-        data=json.dumps(payload).encode("utf-8"),
-        headers=headers,
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, context=ssl_ctx, timeout=20) as resp:
-            return resp.status, dict(resp.headers), resp.read().decode("utf-8")
-    except urllib.error.HTTPError as err:
-        return err.code, dict(err.headers), err.read().decode("utf-8")
+    body_bytes = json.dumps(payload).encode("utf-8")
+    for attempt in range(1, 7):
+        req = urllib.request.Request(
+            MCP_URL,
+            data=body_bytes,
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, context=ssl_ctx, timeout=20) as resp:
+                return resp.status, dict(resp.headers), resp.read().decode("utf-8")
+        except urllib.error.HTTPError as err:
+            return err.code, dict(err.headers), err.read().decode("utf-8")
+        except (urllib.error.URLError, ssl.SSLError, TimeoutError) as exc:
+            if attempt == 6:
+                raise
+            print(
+                f"      ... retrying POST /mcp after transient Envoy/PSC handshake convergence ({attempt}/6: {exc})"
+            )
+            time.sleep(5)
+    raise RuntimeError("Unreachable")
 
 
 def main() -> int:
@@ -87,19 +97,25 @@ def main() -> int:
     )
     health = {}
     health_status = 0
-    for attempt in range(1, 13):
+    consecutive_ok = 0
+    for attempt in range(1, 19):
         try:
             with urllib.request.urlopen(HEALTH_URL, context=ssl_ctx, timeout=20) as resp:
                 health_status = resp.status
                 health = json.loads(resp.read().decode("utf-8"))
-                break
+                consecutive_ok += 1
+                if consecutive_ok >= 3:
+                    break
+                time.sleep(1)
+                continue
         except (urllib.error.HTTPError, urllib.error.URLError, ssl.SSLError, TimeoutError, json.JSONDecodeError) as exc:
-            if attempt == 12:
+            consecutive_ok = 0
+            if attempt == 18:
                 raise
             print(
-                f"      ... waiting for Regional ALB / PSC / Apigee data plane convergence (attempt {attempt}/12: {exc})"
+                f"      ... waiting for Regional ALB / PSC / Apigee data plane convergence (attempt {attempt}/18: {exc})"
             )
-            time.sleep(10)
+            time.sleep(8)
     print(f"      HTTP {health_status}: {health}")
     assert health_status == 200
     assert health.get("service") == "mcp-countries-poc"

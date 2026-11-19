@@ -63,14 +63,33 @@ else
     --quiet
 fi
 
-echo ""
-echo "=== Verifier Job Output (Cloud Logging) ==="
-gcloud logging read \
-  'resource.type="cloud_run_job" AND resource.labels.job_name="mcp-countries-vpc-verifier"' \
+LATEST_EXEC="$(gcloud run jobs executions list \
+  --job=mcp-countries-vpc-verifier \
+  --region="${REGION}" \
   --project="${HUB_PROJECT_ID}" \
-  --limit=25 \
-  --order=asc \
-  --format="value(textPayload)"
+  --sort-by="~createTime" \
+  --limit=1 \
+  --format="value(name)" 2>/dev/null || true)"
+
+echo ""
+echo "=== Verifier Job Output (Cloud Logging${LATEST_EXEC:+: ${LATEST_EXEC}}) ==="
+LOG_FILTER='resource.type="cloud_run_job" AND resource.labels.job_name="mcp-countries-vpc-verifier"'
+if [[ -n "${LATEST_EXEC}" ]]; then
+  LOG_FILTER="${LOG_FILTER} AND labels.\"run.googleapis.com/execution_name\"=\"${LATEST_EXEC}\""
+fi
+for _ in 1 2 3 4; do
+  LOG_OUT="$(gcloud logging read \
+    "${LOG_FILTER}" \
+    --project="${HUB_PROJECT_ID}" \
+    --limit=40 \
+    --order=asc \
+    --format="value(textPayload)" 2>/dev/null || true)"
+  if [[ -n "${LOG_OUT}" ]]; then
+    echo "${LOG_OUT}"
+    break
+  fi
+  sleep 3
+done
 
 echo ""
 echo "=== [3/3] Gemini Enterprise Web App URL & Sample Prompts ==="

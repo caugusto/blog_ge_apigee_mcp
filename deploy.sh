@@ -19,6 +19,7 @@ UNATTENDED_WORKER=false
 RECONFIGURE=false
 REBUILD_MCP=false
 REDEPLOY_PROXY=false
+REBUILD_VERIFIER=false
 WORKER_EXTRA_ARGS=()
 for arg in "$@"; do
   case "${arg}" in
@@ -27,6 +28,7 @@ for arg in "$@"; do
     --reconfigure) RECONFIGURE=true ;;
     --rebuild-mcp) REBUILD_MCP=true; WORKER_EXTRA_ARGS+=("--rebuild-mcp") ;;
     --redeploy-proxy) REDEPLOY_PROXY=true; WORKER_EXTRA_ARGS+=("--redeploy-proxy") ;;
+    --rebuild-verifier) REBUILD_VERIFIER=true; WORKER_EXTRA_ARGS+=("--rebuild-verifier") ;;
   esac
 done
 
@@ -1948,4 +1950,8 @@ else
   ok "Activated Gemini Enterprise REGISTRY_MCP connector (${GE_COUNTRIES_COLLECTION_ID})."
 fi
 
-./verify.sh
+if [[ "${REBUILD_VERIFIER}" == "true" ]]; then
+  ./verify.sh --rebuild
+else
+  ./verify.sh
+fi
