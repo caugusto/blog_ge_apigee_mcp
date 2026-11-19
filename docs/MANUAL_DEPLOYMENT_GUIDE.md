@@ -97,7 +97,9 @@ gcloud services enable \
   --project="${HUB_PROJECT_ID}"
 
 # Ensure custom MCP connectors and IAM v3 UAP bindings are allowed on HUB_PROJECT_ID
+# (Wait briefly so orgpolicy.googleapis.com enablement propagates on a brand-new project)
 if [[ -n "${ORG_ID}" ]]; then
+  sleep 15
   for CONSTRAINT in \
     discoveryengine.managed.disableCustomMcpServerConnector \
     iam.managed.disableAccessPolicyBinding; do
@@ -107,7 +109,10 @@ spec:
   rules:
   - enforce: false
 EOF
-    gcloud org-policies set-policy "cfg/policy_${CONSTRAINT}.yaml" --project="${HUB_PROJECT_ID}" || true
+    for _ in {1..6}; do
+      gcloud org-policies set-policy "cfg/policy_${CONSTRAINT}.yaml" --project="${HUB_PROJECT_ID}" && break
+      sleep 10
+    done
   done
 fi
 

@@ -20,6 +20,7 @@ RECONFIGURE=false
 REBUILD_MCP=false
 REDEPLOY_PROXY=false
 REBUILD_VERIFIER=false
+ORG_POLICY_JUST_OVERRIDDEN=false
 WORKER_EXTRA_ARGS=()
 for arg in "$@"; do
   case "${arg}" in
@@ -30,6 +31,7 @@ for arg in "$@"; do
     --rebuild-mcp) REBUILD_MCP=true; WORKER_EXTRA_ARGS+=("--rebuild-mcp") ;;
     --redeploy-proxy) REDEPLOY_PROXY=true; WORKER_EXTRA_ARGS+=("--redeploy-proxy") ;;
     --rebuild-verifier) REBUILD_VERIFIER=true; WORKER_EXTRA_ARGS+=("--rebuild-verifier") ;;
+    --org-policy-updated) ORG_POLICY_JUST_OVERRIDDEN=true ;;
   esac
 done
 
@@ -273,6 +275,85 @@ ensure_kms_iam_role() {
       --project="${proj}" >/dev/null
     ok "Granted ${role} on KMS key '${key}'."
   fi
+}
+
+ensure_org_policy_unenforced() {
+  local proj_id="$1"
+  local proj_num="$2"
+  local constraint="$3"
+  local eff_json=""
+  local eff_err=""
+
+  for attempt in {1..8}; do
+    if eff_json="$(gcloud org-policies describe "${constraint}" --project="${proj_id}" --effective --format=json 2>"cfg/.orgpol_err")"; then
+      rm -f "cfg/.orgpol_err"
+      break
+    fi
+    eff_err="$(cat "cfg/.orgpol_err" 2>/dev/null || true)"
+    rm -f "cfg/.orgpol_err"
+    if [[ "${eff_err}" == *"NOT_FOUND"* ]]; then
+      skip "Org policy '${constraint}' has no active enforcement on '${proj_id}'."
+      return 0
+    fi
+    if [[ "${attempt}" -lt 8 && ( "${eff_err}" == *"SERVICE_DISABLED"* || "${eff_err}" == *"not been used"* || "${eff_err}" == *"not enabled"* || "${eff_err}" == *"UNAVAILABLE"* || "${eff_err}" == *"BACKEND_ERROR"* ) ]]; then
+      info "Waiting 10s for orgpolicy.googleapis.com enablement to propagate on '${proj_id}' (attempt ${attempt}/8)..."
+      interruptible_sleep 10
+      continue
+    fi
+    break
+  done
+
+  if [[ -n "${eff_json}" ]]; then
+    local enforced_count unenforced_count
+    enforced_count="$(echo "${eff_json}" | jq -r '[.spec.rules[]? | select(.enforce == true)] | length' 2>/dev/null || echo "1")"
+    unenforced_count="$(echo "${eff_json}" | jq -r '[.spec.rules[]? | select(.enforce == false)] | length' 2>/dev/null || echo "0")"
+    if [[ "${enforced_count}" == "0" && "${unenforced_count}" != "0" ]]; then
+      skip "Org policy '${constraint}' is already unenforced (enforce=false) on '${proj_id}'."
+      return 0
+    fi
+  fi
+
+  info "Disabling Organization Policy 'constraints/${constraint}' (enforce=false) on '${proj_id}'..."
+  cat > "cfg/policy_${constraint}.yaml" <<EOF
+name: projects/${proj_num}/policies/${constraint}
+spec:
+  rules:
+  - enforce: false
+EOF
+
+  local set_out=""
+  local set_ok=false
+  for attempt in {1..8}; do
+    if set_out="$(gcloud org-policies set-policy "cfg/policy_${constraint}.yaml" --project="${proj_id}" 2>&1)"; then
+      set_ok=true
+      break
+    fi
+    if [[ "${attempt}" -lt 8 && ( "${set_out}" == *"SERVICE_DISABLED"* || "${set_out}" == *"not been used"* || "${set_out}" == *"not enabled"* || "${set_out}" == *"UNAVAILABLE"* || "${set_out}" == *"BACKEND_ERROR"* || "${set_out}" == *"ABORTED"* || "${set_out}" == *"CONCURRENT"* ) ]]; then
+      warn "orgpolicy.googleapis.com still warming up on '${proj_id}' (attempt ${attempt}/8); retrying in 10s..."
+      interruptible_sleep 10
+      continue
+    fi
+    break
+  done
+
+  if [[ "${set_ok}" != "true" ]]; then
+    err "Failed to disable 'constraints/${constraint}' on '${proj_id}': ${set_out}"
+    err "Ensure your account holds 'roles/orgpolicy.policyAdmin' at the Organization/Folder/Project level, then re-run ./deploy.sh."
+    exit 1
+  fi
+
+  for _ in {1..12}; do
+    local poll_eff poll_enf
+    poll_eff="$(gcloud org-policies describe "${constraint}" --project="${proj_id}" --effective --format=json 2>/dev/null || true)"
+    poll_enf="$(echo "${poll_eff}" | jq -r '[.spec.rules[]? | select(.enforce == true)] | length' 2>/dev/null || echo "1")"
+    if [[ -n "${poll_eff}" && "${poll_enf}" == "0" ]]; then
+      break
+    fi
+    interruptible_sleep 5
+  done
+
+  ORG_POLICY_JUST_OVERRIDDEN=true
+  ok "Disabled 'constraints/${constraint}' (enforce=false) on '${proj_id}'."
 }
 
 wait_apigee_idle() {
@@ -655,22 +736,11 @@ if [[ -n "${ORG_ID}" ]]; then
   for CONSTRAINT in \
     discoveryengine.managed.disableCustomMcpServerConnector \
     iam.managed.disableAccessPolicyBinding; do
-    ALREADY_UNENFORCED="$(gcloud org-policies describe "${CONSTRAINT}" --project="${HUB_PROJECT_ID}" --format=json 2>/dev/null \
-      | jq -r '[.spec.rules[]? | select(.enforce == false)] | length' 2>/dev/null || echo "0")"
-    if [[ "${ALREADY_UNENFORCED}" != "0" ]]; then
-      skip "Org policy override '${CONSTRAINT}' (enforce=false) already set on '${HUB_PROJECT_ID}'."
-    else
-      info "Setting org policy override '${CONSTRAINT}' (enforce=false) on '${HUB_PROJECT_ID}'..."
-      cat > "cfg/policy_${CONSTRAINT}.yaml" <<EOF
-name: projects/${HUB_PROJECT_NUMBER}/policies/${CONSTRAINT}
-spec:
-  rules:
-  - enforce: false
-EOF
-      gcloud org-policies set-policy "cfg/policy_${CONSTRAINT}.yaml" --project="${HUB_PROJECT_ID}" >/dev/null 2>&1 || \
-        warn "Could not override ${CONSTRAINT} (may already be allowed or require Org Policy Admin)."
-    fi
+    ensure_org_policy_unenforced "${HUB_PROJECT_ID}" "${HUB_PROJECT_NUMBER}" "${CONSTRAINT}"
   done
+  if [[ "${ORG_POLICY_JUST_OVERRIDDEN}" == "true" ]]; then
+    WORKER_EXTRA_ARGS+=("--org-policy-updated")
+  fi
 fi
 
 APIGEE_APIS=(
@@ -1186,7 +1256,10 @@ if [[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(get_
   skip "IAM v3 PolicyBinding 'agent-gateway-allow-binding' already exists."
 else
   info "Binding IAM v3 Universal Access Policy to project '${HUB_PROJECT_ID}'..."
-  for bind_attempt in {1..8}; do
+  if [[ -n "${ORG_ID}" ]]; then
+    ensure_org_policy_unenforced "${HUB_PROJECT_ID}" "${HUB_PROJECT_NUMBER}" "iam.managed.disableAccessPolicyBinding"
+  fi
+  for bind_attempt in {1..10}; do
     BIND_RESP="$(curl -s -X POST \
       "https://iam.googleapis.com/v3/projects/${HUB_PROJECT_ID}/locations/global/policyBindings?policyBindingId=agent-gateway-allow-binding" \
       -H "Authorization: Bearer $(get_token)" \
@@ -1201,9 +1274,9 @@ else
       }")"
     if echo "${BIND_RESP}" | jq -e '.error' >/dev/null 2>&1; then
       BIND_ERR="$(echo "${BIND_RESP}" | jq -c '.error')"
-      if [[ "${bind_attempt}" -lt 8 && ( "${BIND_ERR}" == *"POLICY_NOT_FOUND"* || "${BIND_ERR}" == *"not yet available"* || "${BIND_ERR}" == *"does not exist"* ) ]]; then
-        warn "IAM v3 AccessPolicy 'agent-gateway-allow-policy' still propagating globally (attempt ${bind_attempt}/8); retrying in 10s..."
-        interruptible_sleep 10
+      if [[ "${bind_attempt}" -lt 10 && ( "${BIND_ERR}" == *"POLICY_NOT_FOUND"* || "${BIND_ERR}" == *"not yet available"* || "${BIND_ERR}" == *"does not exist"* || "${BIND_ERR}" == *"ORG_POLICY"* || "${BIND_ERR}" == *"disableAccessPolicyBinding"* ) ]]; then
+        warn "IAM v3 PolicyBinding prerequisite/org-policy still propagating globally (attempt ${bind_attempt}/10); retrying in 15s..."
+        interruptible_sleep 15
         continue
       fi
       err "Failed starting IAM v3 PolicyBinding 'agent-gateway-allow-binding': ${BIND_ERR}"
@@ -1219,8 +1292,8 @@ else
       if [[ "$(echo "${BIND_POLL}" | jq -r '.done // false' 2>/dev/null || echo "false")" == "true" ]]; then
         if echo "${BIND_POLL}" | jq -e '.error' >/dev/null 2>&1; then
           BIND_OP_ERR="$(echo "${BIND_POLL}" | jq -c '.error')"
-          if [[ "${bind_attempt}" -lt 8 && ( "${BIND_OP_ERR}" == *"POLICY_NOT_FOUND"* || "${BIND_OP_ERR}" == *"not yet available"* || "${BIND_OP_ERR}" == *"does not exist"* ) ]]; then
-            warn "IAM v3 AccessPolicy 'agent-gateway-allow-policy' still propagating globally (attempt ${bind_attempt}/8); retrying in 10s..."
+          if [[ "${bind_attempt}" -lt 10 && ( "${BIND_OP_ERR}" == *"POLICY_NOT_FOUND"* || "${BIND_OP_ERR}" == *"not yet available"* || "${BIND_OP_ERR}" == *"does not exist"* || "${BIND_OP_ERR}" == *"ORG_POLICY"* || "${BIND_OP_ERR}" == *"disableAccessPolicyBinding"* ) ]]; then
+            warn "IAM v3 PolicyBinding prerequisite/org-policy still propagating globally (attempt ${bind_attempt}/10); retrying in 15s..."
             BIND_RETRY=true
             break
           fi
@@ -1232,7 +1305,7 @@ else
       interruptible_sleep 3
     done
     if [[ "${BIND_RETRY}" == "true" ]]; then
-      interruptible_sleep 10
+      interruptible_sleep 15
       continue
     fi
     break
@@ -1838,6 +1911,10 @@ ok "Agent Registry MCP Server URI: ${MCP_COUNTRIES_REGISTRY_URI}"
 # ------------------------------------------------------------------------------
 stage "Stage 10: Connect Gemini Enterprise & Run Verification"
 
+if [[ -n "${ORG_ID}" ]]; then
+  ensure_org_policy_unenforced "${HUB_PROJECT_ID}" "${HUB_PROJECT_NUMBER}" "discoveryengine.managed.disableCustomMcpServerConnector"
+fi
+
 COLLECTION_DISPLAY_NAME="mcp-countries-apigee-collection"
 DISCOVERED_COLL="$(curl -s \
   "https://${GE_LOCATION}-discoveryengine.googleapis.com/v1alpha/projects/${HUB_PROJECT_ID}/locations/${GE_LOCATION}/collections" \
@@ -1851,23 +1928,102 @@ if [[ -n "${DISCOVERED_COLL}" ]]; then
   save_env
   skip "Discovery Engine collection '${GE_COUNTRIES_COLLECTION_ID}' already exists."
 else
-  COLLECTION_ID="mcp-countries-apigee-collection-$(date +%s)"
-  info "Creating Gemini Enterprise REGISTRY_MCP data connector collection '${COLLECTION_ID}'..."
-  SETUP_DC_RESP="$(curl -s -X POST \
-    "https://${GE_LOCATION}-discoveryengine.googleapis.com/v1alpha/projects/${HUB_PROJECT_ID}/locations/${GE_LOCATION}:setUpDataConnector" \
-    -H "Authorization: Bearer $(get_token)" \
-    -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" \
-    -H "Content-Type: application/json" \
-    -d "{
-      \"collectionId\": \"${COLLECTION_ID}\",
-      \"collectionDisplayName\": \"${COLLECTION_DISPLAY_NAME}\",
-      \"dataConnector\": {
-        \"dataSource\": \"custom_mcp\",
-        \"dataSourceVersion\": 1,
-        \"params\": {\"oauth_access_token\": \"unused\"},
-        \"refreshInterval\": \"86400s\",
-        \"entities\": [{\"entityName\": \"mcp_data\"}],
-        \"connectorModes\": [\"FEDERATED\"],
+  if [[ "${ORG_POLICY_JUST_OVERRIDDEN}" == "true" && "${SECONDS}" -lt 45 ]]; then
+    WAIT_PROP=$((45 - SECONDS))
+    info "Waiting ${WAIT_PROP}s for newly disabled 'discoveryengine.managed.disableCustomMcpServerConnector' Organization Policy to propagate..."
+    interruptible_sleep "${WAIT_PROP}"
+  fi
+
+  for dc_attempt in {1..12}; do
+    COLLECTION_ID="mcp-countries-apigee-collection-$(date +%s)"
+    info "Creating Gemini Enterprise REGISTRY_MCP data connector collection '${COLLECTION_ID}'..."
+    SETUP_DC_RESP="$(curl -s -X POST \
+      "https://${GE_LOCATION}-discoveryengine.googleapis.com/v1alpha/projects/${HUB_PROJECT_ID}/locations/${GE_LOCATION}:setUpDataConnector" \
+      -H "Authorization: Bearer $(get_token)" \
+      -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" \
+      -H "Content-Type: application/json" \
+      -d "{
+        \"collectionId\": \"${COLLECTION_ID}\",
+        \"collectionDisplayName\": \"${COLLECTION_DISPLAY_NAME}\",
+        \"dataConnector\": {
+          \"dataSource\": \"custom_mcp\",
+          \"dataSourceVersion\": 1,
+          \"params\": {\"oauth_access_token\": \"unused\"},
+          \"refreshInterval\": \"86400s\",
+          \"entities\": [{\"entityName\": \"mcp_data\"}],
+          \"connectorModes\": [\"FEDERATED\"],
+          \"actionConfig\": {
+            \"isActionConfigured\": true,
+            \"createBapConnection\": true,
+            \"actionParams\": {
+              \"auth_type\": \"OAUTH\",
+              \"instance_uri\": \"${COUNTRIES_MCP_URL}\",
+              \"auth_uri\": \"https://accounts.google.com/o/oauth2/v2/auth\",
+              \"auth_uri_params\": \"&access_type=offline&prompt=consent\",
+              \"token_uri\": \"https://oauth2.googleapis.com/token\",
+              \"client_id\": \"${OAUTH_CLIENT_ID}\",
+              \"client_secret\": \"${OAUTH_CLIENT_SECRET}\",
+              \"scopes\": \"openid email profile\",
+              \"client_secret_basic_override\": true,
+              \"mcp_server_source\": \"REGISTRY_MCP\",
+              \"registry_mcp_server_name\": \"${MCP_COUNTRIES_REGISTRY_URI}\",
+              \"mcp_agent_instructions\": \"COUNTRY FACTS APIGEE MCP AGENT: Always invoke list_countries, get_country_facts, or get_authenticated_caller for any question about countries, capitals, ISO codes, populations, currencies, languages, timezones, Japan, Brazil, Norway, Kenya, Canada, Australia, or Apigee X proxy mediation.\",
+              \"use_agent_gateway_egress\": true,
+              \"agent_gateway_engine\": \"projects/${HUB_PROJECT_ID}/locations/global/collections/default_collection/engines/${GE_APP_ID}\"
+            }
+          }
+        }
+      }")"
+    if echo "${SETUP_DC_RESP}" | jq -e '.error' >/dev/null 2>&1; then
+      DC_ERR="$(echo "${SETUP_DC_RESP}" | jq -c '.error')"
+      if [[ "${dc_attempt}" -lt 12 && ( "${DC_ERR}" == *"CUSTOM_ORG_POLICY_VIOLATION"* || "${DC_ERR}" == *"disableCustomMcpServerConnector"* ) ]]; then
+        if [[ -n "${ORG_ID}" ]]; then
+          ensure_org_policy_unenforced "${HUB_PROJECT_ID}" "${HUB_PROJECT_NUMBER}" "discoveryengine.managed.disableCustomMcpServerConnector"
+        fi
+        warn "Org policy override 'discoveryengine.managed.disableCustomMcpServerConnector' still propagating to Discovery Engine (attempt ${dc_attempt}/12); retrying in 15s..."
+        interruptible_sleep 15
+        continue
+      fi
+      err "setUpDataConnector failed: ${DC_ERR}"
+      exit 1
+    fi
+    break
+  done
+
+  GE_COUNTRIES_COLLECTION_ID=""
+  for _ in {1..60}; do
+    GE_COUNTRIES_COLLECTION_ID="$(curl -s \
+      "https://${GE_LOCATION}-discoveryengine.googleapis.com/v1alpha/projects/${HUB_PROJECT_ID}/locations/${GE_LOCATION}/collections" \
+      -H "Authorization: Bearer $(get_token)" \
+      -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" \
+      | jq -r --arg cid "${COLLECTION_ID}" '.collections[]? | select(.name | endswith("/" + $cid)) | .name | split("/") | last' 2>/dev/null || true)"
+    [[ -n "${GE_COUNTRIES_COLLECTION_ID}" ]] && break
+    interruptible_sleep 5
+  done
+  if [[ -z "${GE_COUNTRIES_COLLECTION_ID}" ]]; then
+    err "Timed out waiting for Discovery Engine collection '${COLLECTION_ID}' to appear."
+    exit 1
+  fi
+  save_env
+fi
+
+DC_URL="https://discoveryengine.googleapis.com/v1alpha/projects/${HUB_PROJECT_ID}/locations/global/collections/${GE_COUNTRIES_COLLECTION_ID}/dataConnector"
+DC_CONFIGURED="$(curl -s -H "Authorization: Bearer $(get_token)" -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" "${DC_URL}" \
+  | jq -r --arg reg "${MCP_COUNTRIES_REGISTRY_URI}" \
+    'if (.actionConfig.isActionConfigured == true and .actionConfig.actionParams.registry_mcp_server_name == $reg) then "true" else "false" end' 2>/dev/null || echo "false")"
+
+if [[ "${DC_CONFIGURED}" == "true" ]]; then
+  skip "Gemini Enterprise REGISTRY_MCP connector '${GE_COUNTRIES_COLLECTION_ID}' actionConfig already active."
+else
+  info "Activating Gemini Enterprise REGISTRY_MCP connector actionConfig (${GE_COUNTRIES_COLLECTION_ID})..."
+  for patch_attempt in {1..12}; do
+    DC_PATCH_RESP="$(curl -s -X PATCH \
+      "${DC_URL}?updateMask=actionConfig" \
+      -H "Authorization: Bearer $(get_token)" \
+      -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" \
+      -H "Content-Type: application/json" \
+      -d "{
+        \"name\": \"projects/${HUB_PROJECT_ID}/locations/global/collections/${GE_COUNTRIES_COLLECTION_ID}/dataConnector\",
         \"actionConfig\": {
           \"isActionConfigured\": true,
           \"createBapConnection\": true,
@@ -1888,71 +2044,19 @@ else
             \"agent_gateway_engine\": \"projects/${HUB_PROJECT_ID}/locations/global/collections/default_collection/engines/${GE_APP_ID}\"
           }
         }
-      }
-    }")"
-  if echo "${SETUP_DC_RESP}" | jq -e '.error' >/dev/null 2>&1; then
-    err "setUpDataConnector failed: $(echo "${SETUP_DC_RESP}" | jq -c '.error')"
-    exit 1
-  fi
-
-  GE_COUNTRIES_COLLECTION_ID=""
-  for _ in {1..60}; do
-    GE_COUNTRIES_COLLECTION_ID="$(curl -s \
-      "https://${GE_LOCATION}-discoveryengine.googleapis.com/v1alpha/projects/${HUB_PROJECT_ID}/locations/${GE_LOCATION}/collections" \
-      -H "Authorization: Bearer $(get_token)" \
-      -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" \
-      | jq -r --arg cid "${COLLECTION_ID}" '.collections[]? | select(.name | endswith("/" + $cid)) | .name | split("/") | last' 2>/dev/null || true)"
-    [[ -n "${GE_COUNTRIES_COLLECTION_ID}" ]] && break
-    sleep 5
+      }")"
+    if echo "${DC_PATCH_RESP}" | jq -e '.error' >/dev/null 2>&1; then
+      PATCH_ERR="$(echo "${DC_PATCH_RESP}" | jq -c '.error')"
+      if [[ "${patch_attempt}" -lt 12 && ( "${PATCH_ERR}" == *"CUSTOM_ORG_POLICY_VIOLATION"* || "${PATCH_ERR}" == *"disableCustomMcpServerConnector"* ) ]]; then
+        warn "Org policy override still propagating to Discovery Engine PATCH (attempt ${patch_attempt}/12); retrying in 15s..."
+        interruptible_sleep 15
+        continue
+      fi
+      err "Failed activating dataConnector actionConfig: ${PATCH_ERR}"
+      exit 1
+    fi
+    break
   done
-  if [[ -z "${GE_COUNTRIES_COLLECTION_ID}" ]]; then
-    err "Timed out waiting for Discovery Engine collection '${COLLECTION_ID}' to appear."
-    exit 1
-  fi
-  save_env
-fi
-
-DC_URL="https://discoveryengine.googleapis.com/v1alpha/projects/${HUB_PROJECT_ID}/locations/global/collections/${GE_COUNTRIES_COLLECTION_ID}/dataConnector"
-DC_CONFIGURED="$(curl -s -H "Authorization: Bearer $(get_token)" -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" "${DC_URL}" \
-  | jq -r --arg reg "${MCP_COUNTRIES_REGISTRY_URI}" \
-    'if (.actionConfig.isActionConfigured == true and .actionConfig.actionParams.registry_mcp_server_name == $reg) then "true" else "false" end' 2>/dev/null || echo "false")"
-
-if [[ "${DC_CONFIGURED}" == "true" ]]; then
-  skip "Gemini Enterprise REGISTRY_MCP connector '${GE_COUNTRIES_COLLECTION_ID}' actionConfig already active."
-else
-  info "Activating Gemini Enterprise REGISTRY_MCP connector actionConfig (${GE_COUNTRIES_COLLECTION_ID})..."
-  DC_PATCH_RESP="$(curl -s -X PATCH \
-    "${DC_URL}?updateMask=actionConfig" \
-    -H "Authorization: Bearer $(get_token)" \
-    -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" \
-    -H "Content-Type: application/json" \
-    -d "{
-      \"name\": \"projects/${HUB_PROJECT_ID}/locations/global/collections/${GE_COUNTRIES_COLLECTION_ID}/dataConnector\",
-      \"actionConfig\": {
-        \"isActionConfigured\": true,
-        \"createBapConnection\": true,
-        \"actionParams\": {
-          \"auth_type\": \"OAUTH\",
-          \"instance_uri\": \"${COUNTRIES_MCP_URL}\",
-          \"auth_uri\": \"https://accounts.google.com/o/oauth2/v2/auth\",
-          \"auth_uri_params\": \"&access_type=offline&prompt=consent\",
-          \"token_uri\": \"https://oauth2.googleapis.com/token\",
-          \"client_id\": \"${OAUTH_CLIENT_ID}\",
-          \"client_secret\": \"${OAUTH_CLIENT_SECRET}\",
-          \"scopes\": \"openid email profile\",
-          \"client_secret_basic_override\": true,
-          \"mcp_server_source\": \"REGISTRY_MCP\",
-          \"registry_mcp_server_name\": \"${MCP_COUNTRIES_REGISTRY_URI}\",
-          \"mcp_agent_instructions\": \"COUNTRY FACTS APIGEE MCP AGENT: Always invoke list_countries, get_country_facts, or get_authenticated_caller for any question about countries, capitals, ISO codes, populations, currencies, languages, timezones, Japan, Brazil, Norway, Kenya, Canada, Australia, or Apigee X proxy mediation.\",
-          \"use_agent_gateway_egress\": true,
-          \"agent_gateway_engine\": \"projects/${HUB_PROJECT_ID}/locations/global/collections/default_collection/engines/${GE_APP_ID}\"
-        }
-      }
-    }")"
-  if echo "${DC_PATCH_RESP}" | jq -e '.error' >/dev/null 2>&1; then
-    err "Failed activating dataConnector actionConfig: $(echo "${DC_PATCH_RESP}" | jq -c '.error')"
-    exit 1
-  fi
   ok "Activated Gemini Enterprise REGISTRY_MCP connector (${GE_COUNTRIES_COLLECTION_ID})."
 fi
 
