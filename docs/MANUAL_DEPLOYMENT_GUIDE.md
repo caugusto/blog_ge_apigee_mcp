@@ -180,13 +180,15 @@ done
 
 Google Cloud restricts 3LO Web OAuth 2.0 client creation (`*.apps.googleusercontent.com`) to the Cloud Console for anti-phishing security:
 
-1. Open `https://console.cloud.google.com/auth/clients/create?project=${HUB_PROJECT_ID}` *(if prompted to configure the consent screen first, click **Get Started**, choose **Internal**, and click **Create**)*.
-2. Select Application type: **Web application**.
-3. Under **Authorized redirect URIs**, add:
+1. Open `https://console.cloud.google.com/auth/clients?project=${HUB_PROJECT_ID}`.
+2. **Configure the OAuth consent screen first (required on a new project):** Click **Get started**, enter an **App name** and **User support email**, select Audience **Internal**, enter a **Contact Information** email, check the policy box, and click **Create**.
+3. **Navigate to Clients:** In the left-hand navigation menu, click **Clients**, then click **+ Create client** at the top.
+4. Select Application type **Web application** (and enter any client name).
+5. Under **Authorized redirect URIs**, click **+ Add URI** and paste:
    ```text
    https://vertexaisearch.cloud.google.com/oauth-redirect
    ```
-4. Click **Create** and export your Client ID and Client Secret:
+6. Click **Create**, copy the **Client ID** and **Client secret** from the **OAuth client created** dialog, and export them:
 
 ```bash
 export OAUTH_CLIENT_ID="PASTE_YOUR_OAUTH_CLIENT_ID.apps.googleusercontent.com"
