@@ -23,7 +23,7 @@ Complete reference implementation and automation suite for connecting an **inter
 
 ### Prerequisites
 - `gcloud` (500.0.0+), `curl`, `jq`, `openssl`, `zip`, and `python3` installed (or run directly in Google Cloud Shell).
-- Active Google Cloud billing account + permissions to create two projects (or Admin roles on two blank projects).
+- Active Google Cloud billing account + **Owner/Editor-equivalent permissions** in your organization (**Project Creator**, **Billing Account User**, and **Organization Policy Administrator**, since `./deploy.sh` creates two projects, links billing, grants IAM roles, and relaxes project-level org policy constraints if enforced).
 
 Clone this repository first:
 
