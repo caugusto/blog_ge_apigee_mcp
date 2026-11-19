@@ -85,7 +85,7 @@ on_exit() {
     kill "${SLEEP_PID}" 2>/dev/null || true
     SLEEP_PID=""
   fi
-  rm -f cfg/.iam_*.json 2>/dev/null || true
+  rm -f cfg/.iam_*.json cfg/.orgpol_err 2>/dev/null || true
   if [[ "${UNATTENDED_WORKER}" == "true" ]]; then
     rm -f "${PID_FILE}" 2>/dev/null || true
   fi
@@ -96,6 +96,7 @@ on_exit() {
   if [[ -n "${STOP_SIGNAL}" ]]; then
     echo -e "${RED}==============================================================================${NC}" >&2
     echo -e "${RED} [STOPPED] Received termination signal (${STOP_SIGNAL}); exited cleanly (code ${rc}).${NC}" >&2
+    [[ "${UNATTENDED_WORKER}" == "true" ]] && echo -e "${RED} Watching 'tail -f deploy.log'? Press Ctrl+C now to return to your prompt.${NC}" >&2
     echo -e "${RED} Re-run './deploy.sh' to resume from this exact stage${NC}" >&2
     echo -e "${RED} (all completed resources and IAM bindings will be [SKIP]ped).${NC}" >&2
     echo -e "${RED}==============================================================================${NC}" >&2
@@ -104,12 +105,21 @@ on_exit() {
     [[ -n "${LAST_ERR_LINE}" ]] && loc_msg=" (near line ${LAST_ERR_LINE})"
     echo -e "${RED}==============================================================================${NC}" >&2
     echo -e "${RED} [STOPPED] Deployment exited with code ${rc}${loc_msg}.${NC}" >&2
+    [[ "${UNATTENDED_WORKER}" == "true" ]] && echo -e "${RED} Watching 'tail -f deploy.log'? Press Ctrl+C now to return to your prompt.${NC}" >&2
     echo -e "${RED} Re-run './deploy.sh' to resume from this exact stage${NC}" >&2
     echo -e "${RED} (all completed resources and IAM bindings will be [SKIP]ped).${NC}" >&2
     echo -e "${RED}==============================================================================${NC}" >&2
   else
     echo -e "${GREEN}==============================================================================${NC}"
-    echo -e "${GREEN} [COMPLETE] End-to-end deployment & verification finished successfully!${NC}"
+    echo -e "${GREEN} [COMPLETE] All 10 deployment stages & verification finished successfully!${NC}"
+    echo -e "${GREEN}==============================================================================${NC}"
+    if [[ "${UNATTENDED_WORKER}" == "true" ]]; then
+      echo " -> Background worker has exited cleanly."
+      echo " -> Watching 'tail -f deploy.log'? Press Ctrl+C now to return to your prompt."
+    fi
+    echo " -> Run './verify.sh' anytime if you want to re-run the private hop checks"
+    echo "    or reprint your Gemini Enterprise web app URL and test prompt."
+    echo " -> Run './teardown.sh' when finished testing to stop load balancer charges."
     echo -e "${GREEN}==============================================================================${NC}"
   fi
 }
