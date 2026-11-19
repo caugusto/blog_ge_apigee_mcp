@@ -348,9 +348,10 @@ apigee_post_and_wait() {
       -H "Content-Type: application/json" \
       -d "${body}")"
     if echo "${resp}" | jq -e '.error' >/dev/null 2>&1; then
-      local code
+      local code err_status
       code="$(echo "${resp}" | jq -r '.error.code // 0' 2>/dev/null || echo "0")"
-      if [[ "${attempt}" -lt 3 && ( "${code}" == "400" || "${code}" == "409" || "${code}" == "503" ) ]]; then
+      err_status="$(echo "${resp}" | jq -r '.error.status // ""' 2>/dev/null || echo "")"
+      if [[ "${attempt}" -lt 3 && "${err_status}" != "INVALID_ARGUMENT" && ( "${code}" == "400" || "${code}" == "409" || "${code}" == "503" ) ]]; then
         warn "${label} temporarily locked by Apigee control plane (HTTP ${code}); retrying in 10s (attempt ${attempt}/3)..."
         interruptible_sleep 10
         continue
@@ -1339,7 +1340,7 @@ else
   info "Creating Apigee environment 'eval-mcp'..."
   apigee_post_and_wait \
     "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}/environments" \
-    '{"name": "eval-mcp", "displayName": "Internal MCP Evaluation Env", "deploymentProxyType": "PROGRAMMABLE", "apiProxyType": "PROGRAMMABLE"}' \
+    '{"name": "eval-mcp", "displayName": "Internal MCP Evaluation Env", "deploymentType": "PROXY", "apiProxyType": "PROGRAMMABLE"}' \
     "Apigee environment 'eval-mcp'" 5
   ok "Created Apigee environment 'eval-mcp'."
 fi

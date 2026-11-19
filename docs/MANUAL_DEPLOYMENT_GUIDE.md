@@ -523,7 +523,7 @@ sleep 3 && wait_apigee_idle
 
 OP_ENV=$(curl -s -X POST "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}/environments" \
   -H "Authorization: Bearer $(get_token)" -H "Content-Type: application/json" \
-  -d '{"name": "eval-mcp", "displayName": "Internal MCP Evaluation Env", "deploymentProxyType": "PROGRAMMABLE", "apiProxyType": "PROGRAMMABLE"}' | jq -r '.name')
+  -d '{"name": "eval-mcp", "displayName": "Internal MCP Evaluation Env", "deploymentType": "PROXY", "apiProxyType": "PROGRAMMABLE"}' | jq -r '.name')
 if [[ "${OP_ENV}" == organizations/*/operations/* ]]; then
   while [[ "$(curl -s -H "Authorization: Bearer $(get_token)" "https://apigee.googleapis.com/v1/${OP_ENV}" | jq -r '.done // false')" != "true" ]]; do sleep 5; done
 fi
