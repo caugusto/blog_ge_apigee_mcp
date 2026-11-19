@@ -707,8 +707,7 @@ else
   skip "Google-managed service agents already initialized on '${APIGEE_PROJECT_ID}'."
 fi
 
-if ! project_has_member_any_role "${HUB_PROJECT_ID}" "serviceAccount:service-${HUB_PROJECT_NUMBER}@gcp-sa-agentgateway.iam.gserviceaccount.com" \
-  && ! gcloud iam service-accounts describe "sa-mcp-verifier@${HUB_PROJECT_ID}.iam.gserviceaccount.com" --project="${HUB_PROJECT_ID}" >/dev/null 2>&1; then
+if ! project_has_member_any_role "${HUB_PROJECT_ID}" "serviceAccount:service-${HUB_PROJECT_NUMBER}@gcp-sa-discoveryengine.iam.gserviceaccount.com"; then
   info "Initializing Google-managed service agents on '${HUB_PROJECT_ID}'..."
   for SVC in networkservices.googleapis.com discoveryengine.googleapis.com compute.googleapis.com cloudbuild.googleapis.com; do
     gcloud beta services identity create --service="${SVC}" --project="${HUB_PROJECT_ID}" >/dev/null 2>&1 || true
@@ -717,6 +716,10 @@ if ! project_has_member_any_role "${HUB_PROJECT_ID}" "serviceAccount:service-${H
 else
   skip "Google-managed service agents already initialized on '${HUB_PROJECT_ID}'."
 fi
+
+ensure_project_iam_roles "${HUB_PROJECT_ID}" \
+  "serviceAccount:service-${HUB_PROJECT_NUMBER}@gcp-sa-discoveryengine.iam.gserviceaccount.com" \
+  roles/discoveryengine.serviceAgent
 
 # Grant Cloud Build source-deploy permissions to Default Compute SAs (when iam.automaticIamGrantsForDefaultServiceAccounts is enforced)
 for PAIR in "${HUB_PROJECT_ID}:${HUB_PROJECT_NUMBER}" "${APIGEE_PROJECT_ID}:${APIGEE_PROJECT_NUMBER}"; do
@@ -1239,16 +1242,25 @@ if [[ "${CUR_ENG_AGW}" == *"/agentGateways/${AGW_NAME}" ]]; then
   skip "Engine '${GE_APP_ID}' defaultEgressAgentGateway already bound to '${AGW_NAME}'."
 else
   info "Binding '${GE_APP_ID}' defaultEgressAgentGateway to '${AGW_NAME}'..."
-  ENG_AGW_RESP="$(curl -s -X PATCH \
-    "https://${GE_LOCATION}-discoveryengine.googleapis.com/v1/projects/${HUB_PROJECT_ID}/locations/${GE_LOCATION}/collections/default_collection/engines/${GE_APP_ID}?updateMask=agentGatewaySetting.defaultEgressAgentGateway.name" \
-    -H "Authorization: Bearer $(get_token)" \
-    -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" \
-    -H "Content-Type: application/json" \
-    -d "{\"agentGatewaySetting\": {\"defaultEgressAgentGateway\": {\"name\": \"${AGW_NUMBER_URI}\"}}}")"
-  if echo "${ENG_AGW_RESP}" | jq -e '.error' >/dev/null 2>&1; then
-    err "Failed binding defaultEgressAgentGateway on '${GE_APP_ID}': $(echo "${ENG_AGW_RESP}" | jq -c '.error')"
-    exit 1
-  fi
+  for eng_agw_attempt in {1..6}; do
+    ENG_AGW_RESP="$(curl -s -X PATCH \
+      "https://${GE_LOCATION}-discoveryengine.googleapis.com/v1/projects/${HUB_PROJECT_ID}/locations/${GE_LOCATION}/collections/default_collection/engines/${GE_APP_ID}?updateMask=agentGatewaySetting.defaultEgressAgentGateway.name" \
+      -H "Authorization: Bearer $(get_token)" \
+      -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" \
+      -H "Content-Type: application/json" \
+      -d "{\"agentGatewaySetting\": {\"defaultEgressAgentGateway\": {\"name\": \"${AGW_NUMBER_URI}\"}}}")"
+    if echo "${ENG_AGW_RESP}" | jq -e '.error' >/dev/null 2>&1; then
+      ENG_AGW_ERR="$(echo "${ENG_AGW_RESP}" | jq -c '.error')"
+      if [[ "${eng_agw_attempt}" -lt 6 && ( "${ENG_AGW_ERR}" == *"PERMISSION_DENIED"* || "${ENG_AGW_ERR}" == *"denied"* ) ]]; then
+        warn "Discovery Engine Service Agent IAM still propagating (attempt ${eng_agw_attempt}/6); retrying in 15s..."
+        interruptible_sleep 15
+        continue
+      fi
+      err "Failed binding defaultEgressAgentGateway on '${GE_APP_ID}': ${ENG_AGW_ERR}"
+      exit 1
+    fi
+    break
+  done
   ok "Bound '${GE_APP_ID}' defaultEgressAgentGateway to '${AGW_NAME}'."
 fi
 

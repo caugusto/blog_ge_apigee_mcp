@@ -134,6 +134,10 @@ for SVC in networkservices.googleapis.com discoveryengine.googleapis.com compute
   gcloud beta services identity create --service="${SVC}" --project="${HUB_PROJECT_ID}"
 done
 
+gcloud projects add-iam-policy-binding "${HUB_PROJECT_ID}" \
+  --member="serviceAccount:service-${HUB_PROJECT_NUMBER}@gcp-sa-discoveryengine.iam.gserviceaccount.com" \
+  --role="roles/discoveryengine.serviceAgent" --condition=None --quiet >/dev/null
+
 # Grant Cloud Build source-deploy roles to Default Compute SAs on blank projects
 for PAIR in "${HUB_PROJECT_ID}:${HUB_PROJECT_NUMBER}" "${APIGEE_PROJECT_ID}:${APIGEE_PROJECT_NUMBER}"; do
   IFS=":" read -r P_ID P_NUM <<< "${PAIR}"
