@@ -1229,6 +1229,7 @@ else
   ok "Created IAM v3 PolicyBinding 'agent-gateway-allow-binding'."
 fi
 
+AGW_NUMBER_URI="projects/${HUB_PROJECT_NUMBER}/locations/${REGION}/agentGateways/${AGW_NAME}"
 CUR_ENG_AGW="$(curl -s \
   -H "Authorization: Bearer $(get_token)" \
   -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" \
@@ -1238,12 +1239,16 @@ if [[ "${CUR_ENG_AGW}" == *"/agentGateways/${AGW_NAME}" ]]; then
   skip "Engine '${GE_APP_ID}' defaultEgressAgentGateway already bound to '${AGW_NAME}'."
 else
   info "Binding '${GE_APP_ID}' defaultEgressAgentGateway to '${AGW_NAME}'..."
-  curl -s -X PATCH \
+  ENG_AGW_RESP="$(curl -s -X PATCH \
     "https://${GE_LOCATION}-discoveryengine.googleapis.com/v1/projects/${HUB_PROJECT_ID}/locations/${GE_LOCATION}/collections/default_collection/engines/${GE_APP_ID}?updateMask=agentGatewaySetting.defaultEgressAgentGateway.name" \
     -H "Authorization: Bearer $(get_token)" \
     -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" \
     -H "Content-Type: application/json" \
-    -d "{\"agentGatewaySetting\": {\"defaultEgressAgentGateway\": {\"name\": \"${AGW_URI}\"}}}" >/dev/null
+    -d "{\"agentGatewaySetting\": {\"defaultEgressAgentGateway\": {\"name\": \"${AGW_NUMBER_URI}\"}}}")"
+  if echo "${ENG_AGW_RESP}" | jq -e '.error' >/dev/null 2>&1; then
+    err "Failed binding defaultEgressAgentGateway on '${GE_APP_ID}': $(echo "${ENG_AGW_RESP}" | jq -c '.error')"
+    exit 1
+  fi
   ok "Bound '${GE_APP_ID}' defaultEgressAgentGateway to '${AGW_NAME}'."
 fi
 
@@ -1423,26 +1428,41 @@ if [[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(get_
   skip "Apigee truststore 'mcp-ca-truststore' already exists."
 else
   info "Creating Apigee truststore 'mcp-ca-truststore'..."
-  curl -s -X POST "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}/environments/eval-mcp/keystores" \
+  KS_RESP="$(curl -s -X POST "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}/environments/eval-mcp/keystores" \
     -H "Authorization: Bearer $(get_token)" -H "Content-Type: application/json" \
-    -d '{"name": "mcp-ca-truststore"}' >/dev/null
+    -d '{"name": "mcp-ca-truststore"}')"
+  if echo "${KS_RESP}" | jq -e '.error' >/dev/null 2>&1; then
+    err "Failed creating Apigee truststore 'mcp-ca-truststore': $(echo "${KS_RESP}" | jq -c '.error')"
+    exit 1
+  fi
+  ok "Created Apigee truststore 'mcp-ca-truststore'."
 fi
 
 if [[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(get_token)" "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}/environments/eval-mcp/keystores/mcp-ca-truststore/aliases/mcp-root-ca")" == "200" ]]; then
   skip "Apigee truststore alias 'mcp-root-ca' already uploaded."
 else
   info "Uploading Root CA alias 'mcp-root-ca' to 'mcp-ca-truststore'..."
-  curl -s -X POST "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}/environments/eval-mcp/keystores/mcp-ca-truststore/aliases?alias=mcp-root-ca&format=keycertfile" \
-    -H "Authorization: Bearer $(get_token)" -F "file=@certs/ca.crt" >/dev/null
+  ALIAS_RESP="$(curl -s -X POST "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}/environments/eval-mcp/keystores/mcp-ca-truststore/aliases?alias=mcp-root-ca&format=keycertfile" \
+    -H "Authorization: Bearer $(get_token)" -F "file=@certs/ca.crt")"
+  if echo "${ALIAS_RESP}" | jq -e '.error' >/dev/null 2>&1; then
+    err "Failed uploading alias 'mcp-root-ca': $(echo "${ALIAS_RESP}" | jq -c '.error')"
+    exit 1
+  fi
+  ok "Uploaded Root CA alias 'mcp-root-ca' to 'mcp-ca-truststore'."
 fi
 
 if [[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(get_token)" "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}/environments/eval-mcp/references/mcp-ca-truststore-ref")" == "200" ]]; then
   skip "Apigee truststore reference 'mcp-ca-truststore-ref' already exists."
 else
   info "Creating Apigee truststore reference 'mcp-ca-truststore-ref'..."
-  curl -s -X POST "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}/environments/eval-mcp/references" \
+  REF_RESP="$(curl -s -X POST "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}/environments/eval-mcp/references" \
     -H "Authorization: Bearer $(get_token)" -H "Content-Type: application/json" \
-    -d '{"name": "mcp-ca-truststore-ref", "resourceType": "KeyStore", "refers": "mcp-ca-truststore"}' >/dev/null
+    -d '{"name": "mcp-ca-truststore-ref", "resourceType": "KeyStore", "refers": "mcp-ca-truststore"}')"
+  if echo "${REF_RESP}" | jq -e '.error' >/dev/null 2>&1; then
+    err "Failed creating Apigee truststore reference 'mcp-ca-truststore-ref': $(echo "${REF_RESP}" | jq -c '.error')"
+    exit 1
+  fi
+  ok "Created Apigee truststore reference 'mcp-ca-truststore-ref'."
 fi
 
 # ------------------------------------------------------------------------------
@@ -1880,7 +1900,7 @@ if [[ "${DC_CONFIGURED}" == "true" ]]; then
   skip "Gemini Enterprise REGISTRY_MCP connector '${GE_COUNTRIES_COLLECTION_ID}' actionConfig already active."
 else
   info "Activating Gemini Enterprise REGISTRY_MCP connector actionConfig (${GE_COUNTRIES_COLLECTION_ID})..."
-  curl -s -X PATCH \
+  DC_PATCH_RESP="$(curl -s -X PATCH \
     "${DC_URL}?updateMask=actionConfig" \
     -H "Authorization: Bearer $(get_token)" \
     -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" \
@@ -1907,7 +1927,11 @@ else
           \"agent_gateway_engine\": \"projects/${HUB_PROJECT_ID}/locations/global/collections/default_collection/engines/${GE_APP_ID}\"
         }
       }
-    }" >/dev/null
+    }")"
+  if echo "${DC_PATCH_RESP}" | jq -e '.error' >/dev/null 2>&1; then
+    err "Failed activating dataConnector actionConfig: $(echo "${DC_PATCH_RESP}" | jq -c '.error')"
+    exit 1
+  fi
   ok "Activated Gemini Enterprise REGISTRY_MCP connector (${GE_COUNTRIES_COLLECTION_ID})."
 fi
 

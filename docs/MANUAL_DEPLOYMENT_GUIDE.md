@@ -447,7 +447,7 @@ curl -s -X PATCH \
   -H "Authorization: Bearer $(get_token)" \
   -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" \
   -H "Content-Type: application/json" \
-  -d "{\"agentGatewaySetting\": {\"defaultEgressAgentGateway\": {\"name\": \"${AGW_URI}\"}}}" | jq .
+  -d "{\"agentGatewaySetting\": {\"defaultEgressAgentGateway\": {\"name\": \"projects/${HUB_PROJECT_NUMBER}/locations/${REGION}/agentGateways/${AGW_NAME}\"}}}" | jq .
 ```
 
 ---
