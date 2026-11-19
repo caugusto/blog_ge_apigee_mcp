@@ -14,7 +14,7 @@ ENV_FILE="${ENV_FILE:-.env}"
 LOG_FILE="${SCRIPT_DIR}/deploy.log"
 PID_FILE="${SCRIPT_DIR}/.deploy.pid"
 
-BACKGROUND_MODE=false
+BACKGROUND_MODE=true
 UNATTENDED_WORKER=false
 RECONFIGURE=false
 REBUILD_MCP=false
@@ -24,7 +24,8 @@ WORKER_EXTRA_ARGS=()
 for arg in "$@"; do
   case "${arg}" in
     --background|-b) BACKGROUND_MODE=true ;;
-    --unattended-worker) UNATTENDED_WORKER=true ;;
+    --foreground|-f) BACKGROUND_MODE=false ;;
+    --unattended-worker) UNATTENDED_WORKER=true; BACKGROUND_MODE=false ;;
     --reconfigure) RECONFIGURE=true ;;
     --rebuild-mcp) REBUILD_MCP=true; WORKER_EXTRA_ARGS+=("--rebuild-mcp") ;;
     --redeploy-proxy) REDEPLOY_PROXY=true; WORKER_EXTRA_ARGS+=("--redeploy-proxy") ;;
@@ -93,7 +94,7 @@ on_exit() {
   if [[ -n "${STOP_SIGNAL}" ]]; then
     echo -e "${RED}==============================================================================${NC}" >&2
     echo -e "${RED} [STOPPED] Received termination signal (${STOP_SIGNAL}); exited cleanly (code ${rc}).${NC}" >&2
-    echo -e "${RED} Re-run './deploy.sh --background' to resume from this exact stage${NC}" >&2
+    echo -e "${RED} Re-run './deploy.sh' to resume from this exact stage${NC}" >&2
     echo -e "${RED} (all completed resources and IAM bindings will be [SKIP]ped).${NC}" >&2
     echo -e "${RED}==============================================================================${NC}" >&2
   elif [[ "${rc}" -ne 0 ]]; then
@@ -101,7 +102,7 @@ on_exit() {
     [[ -n "${LAST_ERR_LINE}" ]] && loc_msg=" (near line ${LAST_ERR_LINE})"
     echo -e "${RED}==============================================================================${NC}" >&2
     echo -e "${RED} [STOPPED] Deployment exited with code ${rc}${loc_msg}.${NC}" >&2
-    echo -e "${RED} Re-run './deploy.sh --background' to resume from this exact stage${NC}" >&2
+    echo -e "${RED} Re-run './deploy.sh' to resume from this exact stage${NC}" >&2
     echo -e "${RED} (all completed resources and IAM bindings will be [SKIP]ped).${NC}" >&2
     echo -e "${RED}==============================================================================${NC}" >&2
   else
