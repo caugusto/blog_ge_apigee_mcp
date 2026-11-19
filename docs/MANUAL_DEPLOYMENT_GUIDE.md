@@ -433,10 +433,14 @@ EOF
 gcloud iam access-policies create agent-gateway-allow-policy \
   --details-rules=cfg/uap-allow-registered.json --project="${HUB_PROJECT_ID}" --location=global
 
-gcloud iam policy-bindings create agent-gateway-allow-binding \
+# IAM v3 AccessPolicy takes ~5-15s to propagate globally before PolicyBinding can reference it:
+until gcloud iam policy-bindings create agent-gateway-allow-binding \
   --policy="projects/${HUB_PROJECT_ID}/locations/global/accessPolicies/agent-gateway-allow-policy" \
   --target-resource="//cloudresourcemanager.googleapis.com/projects/${HUB_PROJECT_ID}" \
-  --project="${HUB_PROJECT_ID}" --location=global
+  --project="${HUB_PROJECT_ID}" --location=global; do
+  echo "Waiting 10s for IAM v3 AccessPolicy propagation..."
+  sleep 10
+done
 
 curl -s -X PATCH \
   "https://${GE_LOCATION}-discoveryengine.googleapis.com/v1/projects/${HUB_PROJECT_ID}/locations/${GE_LOCATION}/collections/default_collection/engines/${GE_APP_ID}?updateMask=agentGatewaySetting.defaultEgressAgentGateway.name" \

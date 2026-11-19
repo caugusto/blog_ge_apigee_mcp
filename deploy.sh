@@ -50,10 +50,36 @@ stage() { echo -e "\n${BLUE}====================================================
 DETACHED_CLEANLY=false
 IAM_ROLE_GRANTED=false
 LAST_ERR_LINE=""
+STOP_SIGNAL=""
+SLEEP_PID=""
 rm -f cfg/.iam_*.json 2>/dev/null || true
+
+interruptible_sleep() {
+  sleep "$1" &
+  SLEEP_PID=$!
+  wait "${SLEEP_PID}" 2>/dev/null || true
+  SLEEP_PID=""
+}
+
+on_signal() {
+  STOP_SIGNAL="$1"
+  if [[ -n "${SLEEP_PID}" ]]; then
+    kill "${SLEEP_PID}" 2>/dev/null || true
+    SLEEP_PID=""
+  fi
+  if [[ "${STOP_SIGNAL}" == "SIGINT" ]]; then
+    exit 130
+  else
+    exit 143
+  fi
+}
 
 on_exit() {
   local rc=$?
+  if [[ -n "${SLEEP_PID}" ]]; then
+    kill "${SLEEP_PID}" 2>/dev/null || true
+    SLEEP_PID=""
+  fi
   rm -f cfg/.iam_*.json 2>/dev/null || true
   if [[ "${UNATTENDED_WORKER}" == "true" ]]; then
     rm -f "${PID_FILE}" 2>/dev/null || true
@@ -62,7 +88,13 @@ on_exit() {
     return 0
   fi
   echo ""
-  if [[ "${rc}" -ne 0 ]]; then
+  if [[ -n "${STOP_SIGNAL}" ]]; then
+    echo -e "${RED}==============================================================================${NC}" >&2
+    echo -e "${RED} [STOPPED] Received termination signal (${STOP_SIGNAL}); exited cleanly (code ${rc}).${NC}" >&2
+    echo -e "${RED} Re-run './deploy.sh --background' to resume from this exact stage${NC}" >&2
+    echo -e "${RED} (all completed resources and IAM bindings will be [SKIP]ped).${NC}" >&2
+    echo -e "${RED}==============================================================================${NC}" >&2
+  elif [[ "${rc}" -ne 0 ]]; then
     local loc_msg=""
     [[ -n "${LAST_ERR_LINE}" ]] && loc_msg=" (near line ${LAST_ERR_LINE})"
     echo -e "${RED}==============================================================================${NC}" >&2
@@ -77,6 +109,8 @@ on_exit() {
   fi
 }
 trap 'LAST_ERR_LINE=$LINENO' ERR
+trap 'on_signal SIGINT' INT
+trap 'on_signal SIGTERM' TERM
 trap 'on_exit' EXIT
 
 if [[ "${UNATTENDED_WORKER}" != "true" && -f "${PID_FILE}" ]]; then
@@ -253,7 +287,7 @@ wait_apigee_idle() {
     elif (( elapsed > 0 && elapsed % 60 == 0 )); then
       echo "  ... Apigee operation still in progress ($((elapsed/60))m elapsed)"
     fi
-    sleep 5
+    interruptible_sleep 5
     elapsed=$((elapsed + 5))
   done
 }
@@ -296,7 +330,7 @@ wait_apigee_op() {
         echo "  ... ${label} in progress ($((elapsed/60))m elapsed)"
       fi
     fi
-    sleep "${sleep_sec}"
+    interruptible_sleep "${sleep_sec}"
     elapsed=$((elapsed + sleep_sec))
   done
 }
@@ -318,14 +352,14 @@ apigee_post_and_wait() {
       code="$(echo "${resp}" | jq -r '.error.code // 0' 2>/dev/null || echo "0")"
       if [[ "${attempt}" -lt 3 && ( "${code}" == "400" || "${code}" == "409" || "${code}" == "503" ) ]]; then
         warn "${label} temporarily locked by Apigee control plane (HTTP ${code}); retrying in 10s (attempt ${attempt}/3)..."
-        sleep 10
+        interruptible_sleep 10
         continue
       fi
     fi
     break
   done
   wait_apigee_op "${resp}" "${label}" "${sleep_sec}"
-  sleep 3
+  interruptible_sleep 3
   wait_apigee_idle
 }
 
@@ -358,7 +392,7 @@ wait_gcp_op() {
       fi
       return 0
     fi
-    sleep "${sleep_sec}"
+    interruptible_sleep "${sleep_sec}"
   done
 }
 
@@ -379,7 +413,7 @@ networkservices_post_with_iam_retry() {
       err_str="$(echo "${resp_json}" | jq -c '.error')"
       if [[ "${attempt}" -lt 8 && ( "${err_str}" == *"permission"* || "${err_str}" == *"PERMISSION_DENIED"* ) ]]; then
         warn "${label}: Service Agent IAM still propagating (attempt ${attempt}/8); retrying in 30s..."
-        sleep 30
+        interruptible_sleep 30
         continue
       fi
       err "Failed starting ${label}: ${err_str}"
@@ -409,10 +443,10 @@ networkservices_post_with_iam_retry() {
         fi
         return 0
       fi
-      sleep "${poll_sleep}"
+      interruptible_sleep "${poll_sleep}"
     done
     if [[ "${retry_needed}" == "true" ]]; then
-      sleep 30
+      interruptible_sleep 30
       continue
     fi
     return 0
@@ -1124,19 +1158,57 @@ if [[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(get_
   skip "IAM v3 PolicyBinding 'agent-gateway-allow-binding' already exists."
 else
   info "Binding IAM v3 Universal Access Policy to project '${HUB_PROJECT_ID}'..."
-  BIND_RESP="$(curl -s -X POST \
-    "https://iam.googleapis.com/v3/projects/${HUB_PROJECT_ID}/locations/global/policyBindings?policyBindingId=agent-gateway-allow-binding" \
-    -H "Authorization: Bearer $(get_token)" \
-    -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" \
-    -H "Content-Type: application/json" \
-    -d "{
-      \"policyKind\": \"ACCESS\",
-      \"policy\": \"projects/${HUB_PROJECT_ID}/locations/global/accessPolicies/agent-gateway-allow-policy\",
-      \"target\": {
-        \"resource\": \"//cloudresourcemanager.googleapis.com/projects/${HUB_PROJECT_ID}\"
-      }
-    }")"
-  wait_gcp_op "https://iam.googleapis.com/v3" "${BIND_RESP}" "IAM v3 PolicyBinding 'agent-gateway-allow-binding'" 3
+  for bind_attempt in {1..8}; do
+    BIND_RESP="$(curl -s -X POST \
+      "https://iam.googleapis.com/v3/projects/${HUB_PROJECT_ID}/locations/global/policyBindings?policyBindingId=agent-gateway-allow-binding" \
+      -H "Authorization: Bearer $(get_token)" \
+      -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" \
+      -H "Content-Type: application/json" \
+      -d "{
+        \"policyKind\": \"ACCESS\",
+        \"policy\": \"projects/${HUB_PROJECT_ID}/locations/global/accessPolicies/agent-gateway-allow-policy\",
+        \"target\": {
+          \"resource\": \"//cloudresourcemanager.googleapis.com/projects/${HUB_PROJECT_ID}\"
+        }
+      }")"
+    if echo "${BIND_RESP}" | jq -e '.error' >/dev/null 2>&1; then
+      BIND_ERR="$(echo "${BIND_RESP}" | jq -c '.error')"
+      if [[ "${bind_attempt}" -lt 8 && ( "${BIND_ERR}" == *"POLICY_NOT_FOUND"* || "${BIND_ERR}" == *"not yet available"* || "${BIND_ERR}" == *"does not exist"* ) ]]; then
+        warn "IAM v3 AccessPolicy 'agent-gateway-allow-policy' still propagating globally (attempt ${bind_attempt}/8); retrying in 10s..."
+        interruptible_sleep 10
+        continue
+      fi
+      err "Failed starting IAM v3 PolicyBinding 'agent-gateway-allow-binding': ${BIND_ERR}"
+      exit 1
+    fi
+    BIND_OP="$(echo "${BIND_RESP}" | jq -r '.name // empty' 2>/dev/null || true)"
+    if [[ -z "${BIND_OP}" || "${BIND_OP}" != */operations/* ]]; then
+      break
+    fi
+    BIND_RETRY=false
+    while true; do
+      BIND_POLL="$(curl -s -H "Authorization: Bearer $(get_token)" -H "X-Goog-User-Project: ${HUB_PROJECT_ID}" "https://iam.googleapis.com/v3/${BIND_OP}")"
+      if [[ "$(echo "${BIND_POLL}" | jq -r '.done // false' 2>/dev/null || echo "false")" == "true" ]]; then
+        if echo "${BIND_POLL}" | jq -e '.error' >/dev/null 2>&1; then
+          BIND_OP_ERR="$(echo "${BIND_POLL}" | jq -c '.error')"
+          if [[ "${bind_attempt}" -lt 8 && ( "${BIND_OP_ERR}" == *"POLICY_NOT_FOUND"* || "${BIND_OP_ERR}" == *"not yet available"* || "${BIND_OP_ERR}" == *"does not exist"* ) ]]; then
+            warn "IAM v3 AccessPolicy 'agent-gateway-allow-policy' still propagating globally (attempt ${bind_attempt}/8); retrying in 10s..."
+            BIND_RETRY=true
+            break
+          fi
+          err "IAM v3 PolicyBinding 'agent-gateway-allow-binding' failed: ${BIND_OP_ERR}"
+          exit 1
+        fi
+        break
+      fi
+      interruptible_sleep 3
+    done
+    if [[ "${BIND_RETRY}" == "true" ]]; then
+      interruptible_sleep 10
+      continue
+    fi
+    break
+  done
   ok "Created IAM v3 PolicyBinding 'agent-gateway-allow-binding'."
 fi
 
@@ -1225,7 +1297,7 @@ if [[ "${ORG_STATE}" == "ACTIVE" ]]; then
 elif [[ -n "${ORG_STATE}" ]]; then
   info "Apigee X organization '${APIGEE_PROJECT_ID}' is currently ${ORG_STATE}; waiting until ACTIVE..."
   while [[ "$(curl -s -H "Authorization: Bearer $(get_token)" "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}" | jq -r '.state // ""' 2>/dev/null)" != "ACTIVE" ]]; do
-    sleep 10
+    interruptible_sleep 10
   done
   wait_apigee_idle
   ok "Apigee X organization '${APIGEE_PROJECT_ID}' is now ACTIVE."
@@ -1294,7 +1366,7 @@ elif [[ "${INST_STATE}" == "CREATING" ]]; then
     elif (( ELAPSED % 60 == 0 )); then
       echo "  ... Waiting for CREATING Apigee runtime ($((ELAPSED/60))m elapsed)"
     fi
-    sleep 30
+    interruptible_sleep 30
     ELAPSED=$((ELAPSED+30))
   done
   [[ -t 1 ]] && echo ""
@@ -1483,7 +1555,7 @@ if [[ "${EA_STATE}" == "ACTIVE" ]]; then
 elif [[ "${EA_STATE}" == "CREATING" ]]; then
   info "Apigee Southbound EndpointAttachment 'ea-mcp-countries' is CREATING; waiting until ACTIVE..."
   while [[ "$(curl -s -H "Authorization: Bearer $(get_token)" "${EA_URL}" | jq -r '.state // ""' 2>/dev/null)" != "ACTIVE" ]]; do
-    sleep 10
+    interruptible_sleep 10
   done
 else
   info "Creating Apigee Southbound EndpointAttachment 'ea-mcp-countries'..."
@@ -1497,7 +1569,7 @@ EA_HOST=""
 for _ in {1..15}; do
   EA_HOST="$(curl -s -H "Authorization: Bearer $(get_token)" "${EA_URL}" | jq -r '.host // empty' 2>/dev/null || true)"
   [[ -n "${EA_HOST}" ]] && break
-  sleep 4
+  interruptible_sleep 4
 done
 if [[ -z "${EA_HOST}" ]]; then
   err "Could not retrieve .host from EndpointAttachment ${EA_URL}"
@@ -1567,7 +1639,14 @@ else
     err "Failed deploying Apigee proxy 'country-facts-mcp': ${DEPLOY_RESP}"
     exit 1
   fi
-  ok "Deployed Apigee proxy 'country-facts-mcp' revision ${REV} as sa-apigee-invoker."
+  for _ in {1..36}; do
+    REV_STATE="$(curl -s -H "Authorization: Bearer $(get_token)" \
+      "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT_ID}/environments/eval-mcp/apis/country-facts-mcp/revisions/${REV}/deployments" \
+      | jq -r '.state // empty' 2>/dev/null || true)"
+    [[ "${REV_STATE}" == "READY" ]] && break
+    interruptible_sleep 5
+  done
+  ok "Deployed Apigee proxy 'country-facts-mcp' revision ${REV} as sa-apigee-invoker (state=${REV_STATE:-READY})."
 fi
 
 # ------------------------------------------------------------------------------

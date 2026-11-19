@@ -8,6 +8,7 @@ import os
 import socket
 import ssl
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -66,7 +67,16 @@ def main() -> int:
     ssl_ctx = make_ssl_context()
 
     print(f"[1/4] Resolving Private Cloud DNS for {COUNTRIES_HOST}...")
-    resolved_ip = socket.gethostbyname(COUNTRIES_HOST)
+    resolved_ip = ""
+    for attempt in range(1, 13):
+        try:
+            resolved_ip = socket.gethostbyname(COUNTRIES_HOST)
+            break
+        except socket.gaierror as exc:
+            if attempt == 12:
+                raise
+            print(f"      ... waiting for Cloud DNS propagation (attempt {attempt}/12: {exc})")
+            time.sleep(10)
     print(f"      {COUNTRIES_HOST} -> {resolved_ip}")
     assert (
         resolved_ip == EXPECTED_HUB_ILB_IP
@@ -75,13 +85,26 @@ def main() -> int:
     print(
         "[2/4] Verifying Hub ALB -> Northbound PSC -> Apigee X -> Southbound PSC -> Cloud Run OIDC (/healthz)..."
     )
-    with urllib.request.urlopen(HEALTH_URL, context=ssl_ctx, timeout=20) as resp:
-        health = json.loads(resp.read().decode("utf-8"))
-        print(f"      HTTP {resp.status}: {health}")
-        assert resp.status == 200
-        assert health.get("service") == "mcp-countries-poc"
-        assert health.get("project") == EXPECTED_APIGEE_PROJECT
-        assert health.get("apigee_proxy") == "country-facts-mcp"
+    health = {}
+    health_status = 0
+    for attempt in range(1, 13):
+        try:
+            with urllib.request.urlopen(HEALTH_URL, context=ssl_ctx, timeout=20) as resp:
+                health_status = resp.status
+                health = json.loads(resp.read().decode("utf-8"))
+                break
+        except (urllib.error.HTTPError, urllib.error.URLError, ssl.SSLError, TimeoutError, json.JSONDecodeError) as exc:
+            if attempt == 12:
+                raise
+            print(
+                f"      ... waiting for Regional ALB / PSC / Apigee data plane convergence (attempt {attempt}/12: {exc})"
+            )
+            time.sleep(10)
+    print(f"      HTTP {health_status}: {health}")
+    assert health_status == 200
+    assert health.get("service") == "mcp-countries-poc"
+    assert health.get("project") == EXPECTED_APIGEE_PROJECT
+    assert health.get("apigee_proxy") == "country-facts-mcp"
 
     print(
         "[3/4] Verifying unauthenticated POST /mcp passes Cloud Run IAM via Apigee OIDC, then returns Layer-7 HTTP 401..."
