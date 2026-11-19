@@ -594,8 +594,14 @@ for PROJ in "${HUB_PROJECT_ID}" "${APIGEE_PROJECT_ID}"; do
     ok "Created project '${PROJ}'."
   fi
 
-  CUR_BILLING="$(gcloud billing projects describe "${PROJ}" --format='value(billingAccountName)' 2>/dev/null || true)"
-  CUR_BILLING_ENABLED="$(gcloud billing projects describe "${PROJ}" --format='value(billingEnabled)' 2>/dev/null || true)"
+  BILLING_JSON=""
+  for _ in 1 2 3; do
+    BILLING_JSON="$(gcloud billing projects describe "${PROJ}" --format=json 2>/dev/null || true)"
+    [[ -n "${BILLING_JSON}" ]] && break
+    sleep 2
+  done
+  CUR_BILLING="$(echo "${BILLING_JSON}" | jq -r '.billingAccountName // empty' 2>/dev/null || true)"
+  CUR_BILLING_ENABLED="$(echo "${BILLING_JSON}" | jq -r '.billingEnabled // false' 2>/dev/null || echo "false")"
   if [[ "${CUR_BILLING}" == "billingAccounts/${BILLING_ACCOUNT_ID}" && ( "${CUR_BILLING_ENABLED}" == "True" || "${CUR_BILLING_ENABLED}" == "true" ) ]]; then
     skip "Billing account '${BILLING_ACCOUNT_ID}' already linked to '${PROJ}'."
   else
@@ -681,7 +687,16 @@ ensure_project_apis "${APIGEE_PROJECT_ID}" "${APIGEE_APIS[@]}"
 
 APIGEE_SERVICE_AGENT="service-${APIGEE_PROJECT_NUMBER}@gcp-sa-apigee.iam.gserviceaccount.com"
 
-if ! project_has_member_any_role "${APIGEE_PROJECT_ID}" "serviceAccount:${APIGEE_SERVICE_AGENT}"; then
+APIGEE_SA_INITIALIZED=false
+if project_has_member_any_role "${APIGEE_PROJECT_ID}" "serviceAccount:${APIGEE_SERVICE_AGENT}"; then
+  APIGEE_SA_INITIALIZED=true
+elif gcloud iam service-accounts get-iam-policy "sa-apigee-invoker@${APIGEE_PROJECT_ID}.iam.gserviceaccount.com" \
+  --project="${APIGEE_PROJECT_ID}" --format=json 2>/dev/null \
+  | jq -e --arg m "serviceAccount:${APIGEE_SERVICE_AGENT}" '.bindings[]?.members[]? | select(. == $m)' >/dev/null 2>&1; then
+  APIGEE_SA_INITIALIZED=true
+fi
+
+if [[ "${APIGEE_SA_INITIALIZED}" != "true" ]]; then
   info "Initializing Google-managed service agents on '${APIGEE_PROJECT_ID}'..."
   for SVC in apigee.googleapis.com cloudkms.googleapis.com compute.googleapis.com cloudbuild.googleapis.com; do
     gcloud beta services identity create --service="${SVC}" --project="${APIGEE_PROJECT_ID}" >/dev/null 2>&1 || true
@@ -691,7 +706,8 @@ else
   skip "Google-managed service agents already initialized on '${APIGEE_PROJECT_ID}'."
 fi
 
-if ! project_has_member_any_role "${HUB_PROJECT_ID}" "serviceAccount:service-${HUB_PROJECT_NUMBER}@gcp-sa-discoveryengine.iam.gserviceaccount.com"; then
+if ! project_has_member_any_role "${HUB_PROJECT_ID}" "serviceAccount:service-${HUB_PROJECT_NUMBER}@gcp-sa-agentgateway.iam.gserviceaccount.com" \
+  && ! gcloud iam service-accounts describe "sa-mcp-verifier@${HUB_PROJECT_ID}.iam.gserviceaccount.com" --project="${HUB_PROJECT_ID}" >/dev/null 2>&1; then
   info "Initializing Google-managed service agents on '${HUB_PROJECT_ID}'..."
   for SVC in networkservices.googleapis.com discoveryengine.googleapis.com compute.googleapis.com cloudbuild.googleapis.com; do
     gcloud beta services identity create --service="${SVC}" --project="${HUB_PROJECT_ID}" >/dev/null 2>&1 || true
