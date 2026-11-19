@@ -2,7 +2,7 @@
 
 This runbook guides you through provisioning the entire two-project **Internal Cloud Run MCP Behind Apigee X + Dual Private Service Connect + Agent Gateway + Gemini Enterprise** architecture manually from the command line, phase by phase.
 
-> **Prefer one-command automation?** Return to the root [`README.md`](../README.md) and run `./deploy.sh` (**Path A**), which automates all steps below from blank Google Cloud projects.
+> **Prefer one-command automation?** Return to the root [`README.md`](../README.md) and run `./deploy.sh --background` (**Path A**), which automates all steps below from blank Google Cloud projects with detached background logging (`deploy.log`) and check-before-act `[SKIP]` resume.
 
 ---
 
