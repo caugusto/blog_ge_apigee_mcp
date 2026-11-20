@@ -46,7 +46,7 @@ cd blog_ge_apigee_mcp
 chmod +x deploy.sh verify.sh teardown.sh
 ./deploy.sh
 tail -f deploy.log
-# Collects initial prompts + OAuth client once, then detaches Stages 3-10 into the background by default (deploy.log).
+# Collects initial prompts + OAuth client once, then detaches Stages 3-10 into the background by default (~45-55 min end-to-end on blank projects; logs in deploy.log).
 # Safe to re-run anytime: checks every API, IAM binding, Cloud Run service, Apigee component, ALB, and connector first and [SKIP]s anything already configured.
 # Optional flags: --foreground | --reconfigure | --rebuild-mcp | --redeploy-proxy
 ```
