@@ -54,6 +54,12 @@ Re-run the 6-check verification suite anytime:
 
 ![Live Forensic OBO Proof](./images/06_live_obo_audit_evidence.jpg)
 
+Live Gemini Enterprise end-to-end verification (`query_top_usa_names` + `verify_obo_credential_evidence`):
+
+![Gemini Enterprise BigQuery OBO Query Response](./images/07_ge_bq_obo_query_response.png)
+
+![Gemini Enterprise OBO Credential Evidence](./images/08_ge_bq_obo_identity_evidence.png)
+
 ---
 
 ### Path B: Step-by-Step Manual CLI Deployment
