@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<RaiseFault async="false" continueOnError="false" enabled="true" name="RF-Invalid-OAuth-Token">
+  <DisplayName>RF-Invalid-OAuth-Token</DisplayName>
+  <FaultResponse>
+    <Set>
+      <Headers>
+        <Header name="WWW-Authenticate">Bearer realm="bq-obo-mcp", error="invalid_token", error_description="OAuth 2.0 access token rejected by Google tokeninfo"</Header>
+      </Headers>
+      <Payload contentType="application/json" variablePrefix="@" variableSuffix="#">{"error":"invalid_token","error_description":"OAuth 2.0 access token is invalid or expired.","enforced_by":"apigee-x-gateway"}</Payload>
+      <StatusCode>401</StatusCode>
+    </Set>
+  </FaultResponse>
+  <IgnoreUnresolvedVariables>true</IgnoreUnresolvedVariables>
+</RaiseFault>

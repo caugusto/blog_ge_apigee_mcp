@@ -1,0 +1,66 @@
+{
+  "tools": [
+    {
+      "name": "query_top_usa_names",
+      "description": "Execute a live BigQuery SQL query against bigquery-public-data.usa_names.usa_1910_current strictly using the signed-in human user's 3LO Google OAuth 2.0 credential (On-Behalf-Of passthrough), returning top baby names by US state alongside cryptographic BigQuery SESSION_USER() and job.user_email proof.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "state": {
+            "type": "string",
+            "description": "Two-letter US state postal code (e.g., CA, NY, TX, WA, FL). Defaults to CA."
+          },
+          "start_year": {
+            "type": "integer",
+            "description": "Minimum birth year inclusive (1910-2025). Defaults to 2015."
+          },
+          "gender": {
+            "type": "string",
+            "description": "Optional gender filter: 'F' or 'M'. Omit to include all."
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Maximum rows to return (1-20). Defaults to 5."
+          }
+        }
+      },
+      "annotations": {
+        "title": "Query Top USA Baby Names (User OBO)",
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "verify_obo_credential_evidence",
+      "description": "Prove end-user credential passthrough (Pattern 2) with two live BigQuery checks: (1) confirm the Cloud Run runtime service account has ZERO BigQuery permissions (HTTP 403 Access Denied on ADC), and (2) run SELECT SESSION_USER() using the end user's OAuth 2.0 token, returning SESSION_USER(), BigQuery job_id, job.user_email, and Cloud Audit Log filter.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      },
+      "annotations": {
+        "title": "Verify End-User BigQuery Credential Evidence",
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "get_authenticated_caller",
+      "description": "Inspect the verified Google OAuth 2.0 caller claims, scopes, Apigee X gateway-attested headers, and zero-privilege Cloud Run service account identity without running a BigQuery job.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      },
+      "annotations": {
+        "title": "Get OBO Caller & Apigee Gateway Context",
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    }
+  ]
+}

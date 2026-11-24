@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<ServiceCallout async="false" continueOnError="true" enabled="true" name="SC-Verify-Google-TokenInfo">
+  <DisplayName>SC-Verify-Google-TokenInfo</DisplayName>
+  <Request clearPayload="true" variable="tokeninfoRequest">
+    <IgnoreUnresolvedVariables>false</IgnoreUnresolvedVariables>
+    <Set>
+      <QueryParams>
+        <QueryParam name="access_token">{mcp_oauth_token}</QueryParam>
+      </QueryParams>
+      <Verb>GET</Verb>
+    </Set>
+  </Request>
+  <Response>tokeninfoResponse</Response>
+  <Timeout>5000</Timeout>
+  <HTTPTargetConnection>
+    <URL>https://oauth2.googleapis.com/tokeninfo</URL>
+    <Properties>
+      <Property name="success.codes">2xx,4xx</Property>
+    </Properties>
+  </HTTPTargetConnection>
+</ServiceCallout>

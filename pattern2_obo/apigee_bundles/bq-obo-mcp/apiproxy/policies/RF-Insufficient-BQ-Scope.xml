@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<RaiseFault async="false" continueOnError="false" enabled="true" name="RF-Insufficient-BQ-Scope">
+  <DisplayName>RF-Insufficient-BQ-Scope</DisplayName>
+  <FaultResponse>
+    <Set>
+      <Headers>
+        <Header name="WWW-Authenticate">Bearer realm="bq-obo-mcp", scope="https://www.googleapis.com/auth/bigquery", error="insufficient_scope", error_description="OAuth 2.0 token lacks BigQuery job execution scope"</Header>
+      </Headers>
+      <Payload contentType="application/json" variablePrefix="@" variableSuffix="#">{"error":"insufficient_scope","error_description":"OAuth 2.0 token lacks required BigQuery scope (https://www.googleapis.com/auth/bigquery) needed by jobs.insert.","enforced_by":"apigee-x-gateway"}</Payload>
+      <StatusCode>403</StatusCode>
+    </Set>
+  </FaultResponse>
+  <IgnoreUnresolvedVariables>true</IgnoreUnresolvedVariables>
+</RaiseFault>

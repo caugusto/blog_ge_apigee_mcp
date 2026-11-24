@@ -1,0 +1,31 @@
+# Local configuration & secrets (never commit)
+.env
+.env.*
+!.env.example
+
+# Background deployment logs & PID
+deploy.log
+.deploy.pid
+
+# Generated PKI keys/certs and rendered bundles
+certs/
+*.key
+*.csr
+*.crt
+*.srl
+*.zip
+apigee_bundles/bq-obo-mcp/apiproxy/targets/default.xml
+cfg/allow_custom_mcp_policy.yaml
+cfg/policy_*.yaml
+cfg/iap-authz-ext.yaml
+cfg/uap-allow-registered.json
+cfg/.iam_*.json
+cfg/.orgpol_err
+!cfg/toolspec_bq_obo.json
+verifier_job/ca.crt
+
+# Python & OS artifacts
+__pycache__/
+*.py[cod]
+.venv/
+.DS_Store

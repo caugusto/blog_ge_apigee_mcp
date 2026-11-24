@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<ExtractVariables async="false" continueOnError="false" enabled="true" name="EV-Extract-TokenInfo-Claims">
+  <DisplayName>EV-Extract-TokenInfo-Claims</DisplayName>
+  <Source clearPayload="false">tokeninfoResponse</Source>
+  <JSONPayload>
+    <Variable name="scope">
+      <JSONPath>$.scope</JSONPath>
+    </Variable>
+    <Variable name="email">
+      <JSONPath>$.email</JSONPath>
+    </Variable>
+    <Variable name="sub">
+      <JSONPath>$.sub</JSONPath>
+    </Variable>
+  </JSONPayload>
+  <VariablePrefix>mcp_token</VariablePrefix>
+  <IgnoreUnresolvedVariables>true</IgnoreUnresolvedVariables>
+</ExtractVariables>

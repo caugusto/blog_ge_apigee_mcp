@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<ProxyEndpoint name="default">
+  <Description>Internal PSC Northbound Proxy Endpoint for BigQuery OBO Passthrough MCP</Description>
+  <PreFlow name="PreFlow">
+    <Request>
+      <Step>
+        <Name>SA-RateLimit</Name>
+      </Step>
+      <Step>
+        <Name>AM-Strip-Spoofed-Headers</Name>
+      </Step>
+    </Request>
+    <Response/>
+  </PreFlow>
+  <Flows>
+    <Flow name="MCP-OBO-Scope-Gatekeeper">
+      <Description>Enforce OAuth 2.0 Bearer presence, tokeninfo validity, and auth/bigquery scope on /mcp before invoking Cloud Run</Description>
+      <Request>
+        <Step>
+          <Name>EV-Extract-Bearer-Token</Name>
+        </Step>
+        <Step>
+          <Name>RF-Missing-Bearer-Token</Name>
+          <Condition>(mcp_oauth_token = null) or (mcp_oauth_token = "")</Condition>
+        </Step>
+        <Step>
+          <Name>SC-Verify-Google-TokenInfo</Name>
+        </Step>
+        <Step>
+          <Name>RF-Invalid-OAuth-Token</Name>
+          <Condition>(tokeninfoResponse = null) or (tokeninfoResponse.status.code != 200)</Condition>
+        </Step>
+        <Step>
+          <Name>EV-Extract-TokenInfo-Claims</Name>
+        </Step>
+        <Step>
+          <Name>RF-Insufficient-BQ-Scope</Name>
+          <Condition>(mcp_token.scope = null) or (not (mcp_token.scope ~~ "(^|.* )https://www[.]googleapis[.]com/auth/(bigquery|cloud-platform)( .*|$)"))</Condition>
+        </Step>
+        <Step>
+          <Name>AM-Translate-MCP-Credentials</Name>
+        </Step>
+      </Request>
+      <Response/>
+      <Condition>(proxy.pathsuffix MatchesPath "/mcp") or (proxy.pathsuffix MatchesPath "/mcp/**")</Condition>
+    </Flow>
+  </Flows>
+  <PostFlow name="PostFlow">
+    <Request/>
+    <Response/>
+  </PostFlow>
+  <HTTPProxyConnection>
+    <BasePath>/</BasePath>
+  </HTTPProxyConnection>
+  <RouteRule name="default">
+    <TargetEndpoint>default</TargetEndpoint>
+  </RouteRule>
+</ProxyEndpoint>

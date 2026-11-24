@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<APIProxy revision="1" name="bq-obo-mcp">
+  <DisplayName>BigQuery OBO Passthrough Internal MCP Proxy</DisplayName>
+  <Description>Internal Apigee X MCP proxy enforcing anti-spoofing header hygiene, Google OAuth 2.0 tokeninfo introspection, auth/bigquery scope verification, and Cloud Run OIDC credential translation for Pattern 2 End-User Credential Passthrough.</Description>
+  <ProxyEndpoints>
+    <ProxyEndpoint>default</ProxyEndpoint>
+  </ProxyEndpoints>
+  <TargetEndpoints>
+    <TargetEndpoint>default</TargetEndpoint>
+  </TargetEndpoints>
+</APIProxy>

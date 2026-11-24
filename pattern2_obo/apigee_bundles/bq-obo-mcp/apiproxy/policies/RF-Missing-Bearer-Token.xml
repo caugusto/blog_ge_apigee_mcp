@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<RaiseFault async="false" continueOnError="false" enabled="true" name="RF-Missing-Bearer-Token">
+  <DisplayName>RF-Missing-Bearer-Token</DisplayName>
+  <FaultResponse>
+    <Set>
+      <Headers>
+        <Header name="WWW-Authenticate">Bearer realm="bq-obo-mcp", scope="openid email profile https://www.googleapis.com/auth/bigquery", error="invalid_request", error_description="Missing OAuth 2.0 Bearer access token"</Header>
+      </Headers>
+      <Payload contentType="application/json" variablePrefix="@" variableSuffix="#">{"error":"invalid_request","error_description":"Missing OAuth 2.0 Bearer access token at Apigee X gateway.","enforced_by":"apigee-x-gateway"}</Payload>
+      <StatusCode>401</StatusCode>
+    </Set>
+  </FaultResponse>
+  <IgnoreUnresolvedVariables>true</IgnoreUnresolvedVariables>
+</RaiseFault>

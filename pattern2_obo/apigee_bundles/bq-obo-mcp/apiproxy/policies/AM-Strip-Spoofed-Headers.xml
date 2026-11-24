@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<AssignMessage async="false" continueOnError="false" enabled="true" name="AM-Strip-Spoofed-Headers">
+  <DisplayName>AM-Strip-Spoofed-Headers</DisplayName>
+  <Remove>
+    <Headers>
+      <Header name="X-MCP-User-Authorization"/>
+      <Header name="X-Apigee-Verified-Email"/>
+      <Header name="X-Apigee-Verified-Scopes"/>
+      <Header name="X-Apigee-Proxy"/>
+      <Header name="X-Apigee-Org"/>
+    </Headers>
+  </Remove>
+  <Set>
+    <Headers>
+      <Header name="X-Apigee-Proxy">bq-obo-mcp</Header>
+      <Header name="X-Apigee-Org">{organization.name}</Header>
+    </Headers>
+  </Set>
+  <IgnoreUnresolvedVariables>true</IgnoreUnresolvedVariables>
+  <AssignTo createNew="false" transport="http" type="request"/>
+</AssignMessage>
