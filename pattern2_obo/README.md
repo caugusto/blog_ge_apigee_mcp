@@ -2,7 +2,7 @@
 
 ![Hero Banner](./images/01_hero_banner.jpg)
 
-Standalone reference implementation and automation suite for **Enterprise MCP Credential Pattern 2 (On-Behalf-Of / End-User Credential Passthrough)**. This directory builds on [Part 1 (`blog_ge_apigee_mcp` root)](../README.md) while keeping 100% of Part 1's scripts and assets untouched, standing up two dedicated Google Cloud projects from scratch so **Gemini Enterprise** queries **Google BigQuery** (`bigquery-public-data.usa_names.usa_1910_current`) **strictly under the signed-in employee's 3LO Google OAuth 2.0 credential (`SESSION_USER()`)** across **Agent Gateway**, **Northbound & Southbound Private Service Connect (PSC)**, and **Apigee X**.
+Standalone reference implementation and automation suite for **Enterprise MCP Credential Pattern 2 (On-Behalf-Of / End-User Credential Passthrough)**, accompanying **[Part 2 on Medium](https://alldata.medium.com/how-to-run-bigquery-mcp-tools-as-the-signed-in-user-behind-apigee-x-3bdc645a4abc)**. This directory builds on [Part 1 (`blog_ge_apigee_mcp` root)](../README.md) while keeping 100% of Part 1's scripts and assets untouched, standing up two dedicated Google Cloud projects from scratch so **Gemini Enterprise** queries **Google BigQuery** (`bigquery-public-data.usa_names.usa_1910_current`) **strictly under the signed-in employee's 3LO Google OAuth 2.0 credential (`SESSION_USER()`)** across **Agent Gateway**, **Northbound & Southbound Private Service Connect (PSC)**, and **Apigee X**.
 
 ---
 
