@@ -478,6 +478,8 @@ curl -s -X POST "https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT
 
 ## Phase 7: Provision Southbound PSC, Internal HTTPS ALB, and two-pass `EA_HOST` SAN cert
 
+> **Production PKI alternative:** If your corporate CA does not allow IP SANs (`IP:${EA_HOST}`), you can instead configure [Apigee private DNS peering](https://docs.cloud.google.com/apigee/docs/api-platform/architecture/southbound-networking-patterns-endpoints#use-a-dns-record) (`organizations.dnsZones` with `roles/dns.peer` on the Apigee service agent) to a private Cloud DNS zone in `vpc-apigee-mcp`, map a hostname to `${EA_HOST}`, and issue a single standard DNS-SAN certificate upfront.
+
 ```bash
 gcloud compute networks create vpc-apigee-mcp --subnet-mode=custom --project="${APIGEE_PROJECT_ID}"
 
